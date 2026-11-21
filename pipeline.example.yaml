@@ -1,0 +1,217 @@
+# Example AFK Pipeline Configuration (pipeline.yaml)
+# Demonstrates full decoupling of agent provider profiles from pipeline roles.
+# Swap Master / Worker / Reviewer simply by changing `roles:` or `providers:`.
+
+schema_version: 1
+
+project:
+  name: "example-app"
+  pipeline_dir: ".pipeline"
+  agents_file: "AGENTS.md"
+  agent_roles_dir: ".agents"
+  anti_laziness_file: ".agents/anti_laziness_openai.md"
+  tasks_file: "tasks.json"
+  repo_map_ignore:
+    - ".git"
+    - ".pipeline"
+    - ".venv"
+    - "venv"
+    - "node_modules"
+    - "__pycache__"
+    - ".pytest_cache"
+    - ".mypy_cache"
+    - ".ruff_cache"
+    - "dist"
+    - "build"
+    - ".next"
+
+providers:
+  # Fast worker via Codex CLI (works with ChatGPT Plus OAuth OR OPENAI_API_KEY via optional `${VAR:-}`)
+  provider_fast:
+    kind: "cli"
+    can_edit_files: true
+    command: ["codex", "exec"]
+    prompt_mode: "stdin"
+    args_template: ["--full-auto", "--model", "{model}", "-o", "{output_file}", "-"]
+    model: "gpt-5-codex-mini"
+    env:
+      OPENAI_API_KEY: "${OPENAI_API_KEY:-}"
+    output_parser: "plain"
+    timeout_seconds: 900
+    anti_laziness: true
+    rate_limit_patterns:
+      - '\b429\b'
+      - 'rate[\s_-]*limit'
+      - 'quota[\s_-]*exceeded'
+      - 'too many requests'
+      - 'usage limit reached'
+    rate_limit_cooldown_seconds: 900
+    quota_window_seconds: 18000
+    quota_max_requests: 120
+
+  # Main worker via Antigravity CLI (tempfile prompt delivery, non-interactive)
+  provider_main:
+    kind: "cli"
+    can_edit_files: true
+    command: ["agy", "run"]
+    prompt_mode: "tempfile"
+    args_template: ["--non-interactive", "--prompt-file", "{prompt_file}"]
+    output_parser: "plain"
+    timeout_seconds: 900
+    anti_laziness: false
+    rate_limit_cooldown_seconds: 900
+    quota_window_seconds: 18000
+    quota_max_requests: 80
+
+  # Strong worker via abstract/custom CLI agent (e.g., Claude Code, Gemini CLI, Aider, or custom script)
+  provider_strong:
+    kind: "cli"
+    can_edit_files: true
+    command: ["claude", "-p"]
+    prompt_mode: "stdin"
+    args_template: ["--output-format", "json"]
+    output_parser: "json_field"
+    output_json_path: "result"
+    env:
+      ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY:-}"
+    timeout_seconds: 900
+    anti_laziness: false
+    rate_limit_cooldown_seconds: 900
+    quota_window_seconds: 18000
+
+  # Master CLI profile (can edit files -> valid for architect, refactorer, worker_hard, AND read-only roles)
+  provider_master:
+    kind: "cli"
+    can_edit_files: true
+    command: ["codex", "exec"]
+    prompt_mode: "stdin"
+    args_template: ["--full-auto", "--model", "{model}", "-o", "{output_file}", "-"]
+    model: "gpt-5-codex"
+    env:
+      OPENAI_API_KEY: "${OPENAI_API_KEY:-}"
+    output_parser: "plain"
+    timeout_seconds: 900
+    anti_laziness: true
+    rate_limit_cooldown_seconds: 900
+    quota_window_seconds: 18000
+    quota_max_requests: 60
+
+  # Read-only API provider example (can_edit_files defaults to false).
+  # Valid ONLY for read-only roles: `planner`, `pre_reviewer`, `reviewer`.
+  # Assigning it to `worker_*`, `architect`, or `refactorer` fails config validation.
+  provider_reviewer_api:
+    kind: "api"
+    can_edit_files: false
+    base_url: "https://api.openai.com/v1"
+    api_key_env: "REVIEWER_API_KEY"
+    model: "gpt-5"
+    temperature: 0.1
+    timeout_seconds: 300
+    anti_laziness: false
+    rate_limit_cooldown_seconds: 900
+    quota_window_seconds: 18000
+
+# Role-to-profile mapping (change Master or Worker without touching orchestrator code)
+roles:
+  planner: "provider_master"          # Can also use `provider_reviewer_api`
+  worker_easy: "provider_fast"
+  worker_medium: "provider_main"
+  worker_hard: "provider_strong"
+  pre_reviewer: "provider_main"       # Can also use `provider_reviewer_api`
+  reviewer: "provider_master"         # Can also use `provider_reviewer_api`
+  architect: "provider_master"        # Must have can_edit_files: true
+  refactorer: "provider_master"       # Must have can_edit_files: true
+
+zones:
+  red_protected:
+    - ".pipeline/**"
+    - "pipeline.yaml"
+    - ".env*"
+    - "**/.env*"
+    - ".agents/**"
+    - "AGENTS.md"
+    - "docs/specs/**"
+  test_patterns:
+    - "tests/**"
+    - "**/tests/**"
+    - "**/test_*.py"
+    - "**/*_test.py"
+    - "**/*.test.*"
+    - "**/*.spec.*"
+  yellow_shared:
+    - "pyproject.toml"
+    - "package.json"
+    - "tsconfig.json"
+    - "src/shared/**"
+    - "src/db/**"
+    - "src/router*"
+    - "src/routes/**"
+
+diff_guard:
+  limits:
+    easy:   { max_files: 5,  max_lines: 200 }
+    medium: { max_files: 12, max_lines: 600 }
+    hard:   { max_files: 25, max_lines: 1500 }
+  architect_limit:  { max_files: 15, max_lines: 800 }
+  refactorer_limit: { max_files: 30, max_lines: 1800 }
+  exclude_from_review:
+    - "**/package-lock.json"
+    - "**/pnpm-lock.yaml"
+    - "**/yarn.lock"
+    - "**/poetry.lock"
+    - "**/uv.lock"
+    - "**/*.svg"
+    - "**/*.png"
+    - "**/*.jpg"
+    - "dist/**"
+    - "build/**"
+    - "**/*.generated.*"
+
+placeholder_guard:
+  enabled: true
+  extra_patterns: []
+  allow_in_paths: []
+
+gates:
+  - name: "lint"
+    command: ["ruff", "check", "."]
+    timeout_seconds: 120
+    kind: "command"
+    optional: false
+  - name: "typecheck"
+    command: ["mypy", "src"]
+    timeout_seconds: 180
+    kind: "command"
+    optional: false
+  - name: "unit_tests"
+    command: ["pytest", "-q"]
+    timeout_seconds: 300
+    kind: "command"
+    optional: false
+  # Optional Playwright / UI gate (screenshots written to $ORCHESTRATOR_SCREENSHOTS_DIR)
+  # - name: "ui_smoke"
+  #   command: ["npx", "playwright", "test", "--grep", "@smoke"]
+  #   timeout_seconds: 300
+  #   kind: "playwright"
+  #   optional: false
+
+workflow:
+  max_review_rounds: 3
+  max_gate_retries_per_round: 3
+  hard_split_after_rounds: 2
+  batch_review_size: 3
+  refactor_every_n_tasks: 6
+  refactor_on_stage_complete: true
+  cleanup_ports: []
+  transient_retry_delays_seconds: [10, 30, 90]
+  retry_on_timeout_readonly: 1
+  auto_commit: true
+  commit_prefix: "feat"
+  strict_clean_start: true
+
+notifications:
+  telegram:
+    enabled: false
+    bot_token_env: "TELEGRAM_BOT_TOKEN"
+    chat_id_env: "TELEGRAM_CHAT_ID"
+    timeout_seconds: 10

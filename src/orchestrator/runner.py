@@ -1,0 +1,2064 @@
+"""Main headless AFK orchestrator runner with routing, batch review, escalation, splitting, and guards."""
+
+from __future__ import annotations
+
+import contextlib
+import json
+import os
+import re
+import time
+from datetime import UTC, datetime
+from pathlib import Path
+from typing import Any, Literal
+
+from orchestrator.config import PipelineConfig
+from orchestrator.control import ControlPlane, InboxManager
+from orchestrator.diff_guard import (
+    DiffGuardReport,
+    GuardViolation,
+    evaluate_diff,
+    matches_any_glob,
+)
+from orchestrator.events import EventBus
+from orchestrator.fs_utils import (
+    atomic_write_json,
+    atomic_write_text,
+    diff_directory_snapshots,
+    normalize_newlines,
+    snapshot_directory_hashes,
+)
+from orchestrator.gates import GateRunner
+from orchestrator.git_ops import GitChange, GitOperationError, GitOps
+from orchestrator.models import (
+    READ_ONLY_ROLES,
+    AgentRole,
+    ControlAction,
+    ControlCommand,
+    EventType,
+    ParsedWorkerOutput,
+    ReviewVerdictType,
+    RunStatus,
+    Task,
+    TaskComplexity,
+    TaskStatus,
+    WorkerStatus,
+    utc_now_iso,
+)
+from orchestrator.notifications import BaseNotifier, build_notifier
+from orchestrator.output_parser import (
+    parse_batch_review_verdicts,
+    parse_planner_subtasks,
+    parse_single_review_verdict,
+    parse_worker_output,
+)
+from orchestrator.process_utils import cleanup_ports, is_process_alive
+from orchestrator.prompt_builder import BuiltPrompt, PromptBuilder, generate_repo_map
+from orchestrator.providers.base import ProviderRegistry, ProviderRequest, ProviderResponse
+from orchestrator.reporter import write_report
+from orchestrator.stores.base import BaseTaskStore
+
+_PERMANENT_ERROR_RE = re.compile(
+    r"(?:\b401\b|\b403\b|unauthorized|forbidden|invalid[\s_-]*api[\s_-]*key|"
+    r"authentication[\s_-]*failed|auth[\s_-]*failed|unknown\s+option|"
+    r"unrecognized\s+arguments?|invalid\s+option|command\s+not\s+found|"
+    r"FileNotFoundError|is\s+not\s+recognized\s+as\s+an\s+internal\s+or\s+external\s+command)",
+    re.IGNORECASE,
+)
+
+_TRANSIENT_ERROR_RE = re.compile(
+    r"(?:\b502\b|\b503\b|\b504\b|bad\s+gateway|service\s+unavailable|"
+    r"gateway\s+timeout|connection\s+reset|econnreset|etimedout|"
+    r"broken\s+pipe|\beof\b|temporary\s+failure|network|connection\s+refused|"
+    r"econnrefused|socket\s+hang\s+up|tls\s+handshake|remote\s+disconnected)",
+    re.IGNORECASE,
+)
+
+
+def classify_provider_failure(
+    response: ProviderResponse,
+) -> Literal["none", "timeout", "permanent", "transient"]:
+    """Classify a failed provider response as permanent (fail-fast), transient (retry), or timeout."""
+    if response.exit_code == 0 and not response.timed_out:
+        return "none"
+    if response.timed_out:
+        return "timeout"
+    combined = f"{response.raw_stderr}\n{response.raw_stdout}"
+    if _PERMANENT_ERROR_RE.search(combined):
+        return "permanent"
+    if _TRANSIENT_ERROR_RE.search(combined):
+        return "transient"
+    # Empty or abnormal crash (e.g. killed by signal or empty stdout) with no permanent config markers
+    if not combined.strip() or not response.parsed_text.strip() or response.exit_code < 0:
+        return "transient"
+    return "permanent"
+
+
+class OrchestratorFatalError(RuntimeError):
+    """Unrecoverable internal/environment error requiring immediate fail-fast exit."""
+
+
+class RunnerLockError(OrchestratorFatalError):
+    """Raised when another active orchestrator process holds `.pipeline/runner.lock`."""
+
+
+class _AbortedByControlError(Exception):
+    """Internal flow-control signal raised when an operator sends `abort`."""
+
+
+class _PausedByInfraError(Exception):
+    """Raised when a review/architect/planner provider fails after retries so work is preserved."""
+
+    def __init__(
+        self,
+        reason: str,
+        *,
+        task_id: str | None = None,
+        role: AgentRole | None = None,
+        provider: str | None = None,
+    ) -> None:
+        super().__init__(reason)
+        self.reason = reason
+        self.task_id = task_id
+        self.role = role
+        self.provider = provider
+
+
+class OrchestratorRunner:
+    """Headless event-driven AFK pipeline runner."""
+
+    def __init__(
+        self,
+        *,
+        repo_root: Path,
+        config: PipelineConfig,
+        store: BaseTaskStore,
+        registry: ProviderRegistry,
+        event_bus: EventBus | None = None,
+        git_ops: GitOps | None = None,
+        gate_runner: GateRunner | None = None,
+        notifier: BaseNotifier | None = None,
+        sleep_fn: Any = None,
+    ) -> None:
+        self.repo_root = repo_root.resolve()
+        self.config = config
+        self.pipeline_dir = config.pipeline_path(self.repo_root)
+        self.pipeline_dir.mkdir(parents=True, exist_ok=True)
+
+        self.store = store
+        self.registry = registry
+        self.event_bus = event_bus or EventBus(self.pipeline_dir, config, defer_save=True)
+        self.git_ops = git_ops or GitOps(self.repo_root, pipeline_dir=config.project.pipeline_dir)
+        self.gate_runner = gate_runner or GateRunner(self.repo_root, config)
+        self.prompt_builder = PromptBuilder(self.repo_root, config)
+        self.control_plane = ControlPlane(self.pipeline_dir)
+        self.inbox_manager = InboxManager(self.pipeline_dir)
+        self.notifier = notifier or build_notifier(config.notifications)
+        self._sleep = sleep_fn or time.sleep
+
+        self.repo_map_path = self.pipeline_dir / "REPO_MAP.md"
+        self.progress_path = self.pipeline_dir / "PROGRESS.md"
+        self.report_path = self.pipeline_dir / "REPORT.md"
+        self.lock_path = self.pipeline_dir / "runner.lock"
+        self.runs_dir = self.pipeline_dir / "runs" / self.event_bus.run_id
+
+        self._lock_acquired = False
+        self._abort_requested = False
+        self._batch_diffs: dict[str, str] = {}
+        self._attempt_counter: dict[str, int] = {}
+
+    def _acquire_runner_lock(self) -> dict[str, Any] | None:
+        """Acquire `.pipeline/runner.lock`. Raises RunnerLockError if an active PID holds it."""
+        stale_info: dict[str, Any] | None = None
+        if self.lock_path.exists():
+            old_pid: int | None = None
+            old_run_id: str | None = None
+            old_started_at: str | None = None
+            try:
+                raw = json.loads(self.lock_path.read_text(encoding="utf-8"))
+                if isinstance(raw, dict):
+                    raw_pid = raw.get("pid")
+                    old_pid = int(raw_pid) if isinstance(raw_pid, int) else None
+                    old_run_id = str(raw.get("run_id")) if raw.get("run_id") else None
+                    old_started_at = str(raw.get("started_at")) if raw.get("started_at") else None
+            except Exception:
+                old_pid = None
+
+            if old_pid is not None and is_process_alive(old_pid):
+                raise RunnerLockError(
+                    f"Another orchestrator instance is already running "
+                    f"(pid={old_pid}, run_id={old_run_id}, lock={self.lock_path})."
+                )
+            stale_info = {
+                "stale_pid": old_pid,
+                "stale_run_id": old_run_id,
+                "stale_started_at": old_started_at,
+            }
+
+        atomic_write_json(
+            self.lock_path,
+            {
+                "pid": os.getpid(),
+                "run_id": self.event_bus.run_id,
+                "started_at": utc_now_iso(),
+            },
+        )
+        self._lock_acquired = True
+        return stale_info
+
+    def _release_runner_lock(self) -> None:
+        if not self._lock_acquired:
+            return
+        self._lock_acquired = False
+        with contextlib.suppress(OSError):
+            if self.lock_path.exists():
+                self.lock_path.unlink()
+
+    def run(self, *, max_tasks: int | None = None) -> RunStatus:
+        """Execute the AFK pipeline loop until all eligible tasks finish, pause, abort, or fail-fast."""
+        # Acquire PID lock BEFORE touching state.json or git so a second launch cannot corrupt a live run.
+        stale_lock = self._acquire_runner_lock()
+
+        try:
+            if stale_lock is not None:
+                self.event_bus.emit(
+                    EventType.STALE_LOCK_RECOVERED,
+                    payload=stale_lock,
+                )
+
+            self._recover_or_preflight(stale_lock_recovered=stale_lock is not None)
+            self._ensure_progress_file()
+            self._sync_batch_queue_from_store()
+
+            self.event_bus.update_state(
+                status=RunStatus.RUNNING,
+                active_task_id=None,
+                active_task_base_sha=None,
+                active_phase="startup",
+                active_role=None,
+                active_provider=None,
+                paused=False,
+                pause_reason=None,
+                resume_at=None,
+            )
+            self.event_bus.emit(
+                EventType.RUN_STARTED,
+                payload={"project": self.config.project.name, "max_tasks": max_tasks},
+            )
+
+            tasks_processed = 0
+            last_stage: str | None = None
+
+            while True:
+                self._process_control_commands()
+                if self._abort_requested:
+                    raise _AbortedByControlError()
+
+                if self.event_bus.state.pause_after_current or self.event_bus.state.paused:
+                    self._wait_while_paused(reason="operator_pause")
+                    if self._abort_requested:
+                        raise _AbortedByControlError()
+
+                if max_tasks is not None and tasks_processed >= max_tasks:
+                    self._flush_batch_review()
+                    break
+
+                # Resume any task left in ARCH_PENDING after a prior crash before picking new work
+                arch_pending = [
+                    t for t in self.store.list_tasks() if t.status == TaskStatus.ARCH_PENDING
+                ]
+                if arch_pending:
+                    self._resume_arch_pending_task(arch_pending[0])
+                    continue
+
+                next_task = self.store.get_next_available_task()
+
+                if next_task is None:
+                    if self._get_batch_pending_tasks():
+                        self._flush_batch_review()
+                        continue
+                    # Stage / run complete: check periodic/end-of-stage refactoring
+                    if (
+                        self.config.workflow.refactor_on_stage_complete
+                        and self.event_bus.state.accepted_since_last_refactor > 0
+                    ):
+                        self._run_refactorer(reason="stage_or_queue_complete")
+                    break
+
+                # Stage boundary detection -> flush batch & optional end-of-stage refactor
+                if last_stage is not None and next_task.stage != last_stage:
+                    if self._get_batch_pending_tasks():
+                        self._flush_batch_review()
+                        continue
+                    if (
+                        self.config.workflow.refactor_on_stage_complete
+                        and self.event_bus.state.accepted_since_last_refactor > 0
+                    ):
+                        self._run_refactorer(reason=f"stage_complete:{last_stage}")
+
+                # Ensure batch independence BEFORE starting the next task
+                pending_batch = self._get_batch_pending_tasks()
+                if pending_batch and self._must_flush_batch_before(next_task, pending_batch):
+                    self._flush_batch_review()
+                    continue
+
+                last_stage = next_task.stage
+                self._execute_task(next_task)
+                tasks_processed += 1
+
+                # Flush batch if batch size threshold reached
+                if len(self._get_batch_pending_tasks()) >= self.config.workflow.batch_review_size:
+                    self._flush_batch_review()
+
+                # Trigger scheduled refactor every N accepted tasks
+                refactor_n = self.config.workflow.refactor_every_n_tasks
+                if (
+                    refactor_n > 0
+                    and self.event_bus.state.accepted_since_last_refactor >= refactor_n
+                ):
+                    if self._get_batch_pending_tasks():
+                        self._flush_batch_review()
+                    if self.event_bus.state.accepted_since_last_refactor >= refactor_n:
+                        self._run_refactorer(
+                            reason=f"every_{refactor_n}_accepted_tasks",
+                        )
+
+            self.event_bus.update_state(
+                status=RunStatus.COMPLETED,
+                active_task_id=None,
+                active_task_base_sha=None,
+                active_phase="completed",
+                active_role=None,
+                active_provider=None,
+                paused=False,
+                pause_reason=None,
+                resume_at=None,
+            )
+            self.event_bus.emit(EventType.RUN_FINISHED, payload={"tasks_processed": tasks_processed})
+            self._generate_report()
+            self.notifier.send(
+                f"Pipeline Completed ({self.config.project.name})",
+                f"Run {self.event_bus.run_id} finished. Report: {self.report_path}",
+            )
+            return RunStatus.COMPLETED
+
+        except _PausedByInfraError as exc:
+            self.event_bus.update_state(
+                status=RunStatus.PAUSED,
+                active_phase="paused_infra",
+                paused=True,
+                pause_reason=exc.reason,
+                resume_at=None,
+            )
+            self.event_bus.emit(
+                EventType.PAUSE_ENTERED,
+                task_id=exc.task_id,
+                role=exc.role,
+                provider=exc.provider,
+                payload={"reason": exc.reason},
+            )
+            self._generate_report()
+            self.notifier.send(
+                f"Pipeline Paused on Provider Error ({self.config.project.name})",
+                f"Run {self.event_bus.run_id} paused without reverting approved/pending code: {exc.reason}",
+            )
+            return RunStatus.PAUSED
+
+        except _AbortedByControlError:
+            self.event_bus.update_state(
+                status=RunStatus.ABORTED,
+                active_task_id=None,
+                active_task_base_sha=None,
+                active_phase="aborted",
+                active_role=None,
+                active_provider=None,
+                paused=False,
+                pause_reason=None,
+                resume_at=None,
+            )
+            self.event_bus.emit(EventType.RUN_ABORTED, payload={"reason": "control_abort"})
+            self._generate_report()
+            self.notifier.send(
+                f"Pipeline Aborted ({self.config.project.name})",
+                f"Run {self.event_bus.run_id} was aborted via control plane.",
+            )
+            return RunStatus.ABORTED
+
+        except Exception as exc:
+            # Fail-fast: NEVER attempt orchestrator self-repair
+            self.event_bus.emit(
+                EventType.ORCHESTRATOR_FATAL_ERROR,
+                task_id=self.event_bus.state.active_task_id,
+                role=self.event_bus.state.active_role,
+                provider=self.event_bus.state.active_provider,
+                payload={"error_type": type(exc).__name__, "message": str(exc)},
+            )
+            self.event_bus.update_state(
+                status=RunStatus.FAILED,
+                active_phase="fatal_error",
+            )
+            with contextlib.suppress(Exception):
+                self._generate_report()
+            self.notifier.send(
+                f"Orchestrator Fatal Error ({self.config.project.name})",
+                f"{type(exc).__name__}: {exc}",
+            )
+            raise
+        finally:
+            self._release_runner_lock()
+
+    def _recover_or_preflight(self, *, stale_lock_recovered: bool) -> None:
+        if not self.git_ops.is_git_repo():
+            raise OrchestratorFatalError(f"Target path is not a git repository: {self.repo_root}")
+
+        prev = self.event_bus.previous_state
+        prev_was_running = prev is not None and prev.status == RunStatus.RUNNING
+        all_tasks = self.store.list_tasks()
+        interrupted_tasks = [
+            t
+            for t in all_tasks
+            if t.status in (TaskStatus.IN_PROGRESS, TaskStatus.GATES_FAILED, TaskStatus.NEEDS_REVIEW)
+        ]
+        arch_pending_tasks = [t for t in all_tasks if t.status == TaskStatus.ARCH_PENDING]
+        had_crash = (
+            prev_was_running
+            or len(interrupted_tasks) > 0
+            or (stale_lock_recovered and len(arch_pending_tasks) > 0)
+        )
+
+        if had_crash:
+            candidate_sha = prev.active_task_base_sha if prev is not None else None
+            if candidate_sha and self.git_ops.commit_exists(candidate_sha):
+                rollback_sha = candidate_sha
+            else:
+                rollback_sha = self.git_ops.get_head_sha()
+
+            rolled_back = False
+            if self.git_ops.has_uncommitted_changes() or self.git_ops.get_head_sha() != rollback_sha:
+                self.git_ops.hard_rollback(rollback_sha)
+                rolled_back = True
+
+            recovered_ids: list[str] = []
+            for task in interrupted_tasks:
+                self.store.add_comment(
+                    task.id,
+                    author="orchestrator",
+                    kind="system",
+                    body=(
+                        f"Recovered task from '{task.status.value}' to 'todo' "
+                        f"after previous crashed run (base_sha={rollback_sha[:10]})."
+                    ),
+                )
+                self._transition_task(task.id, TaskStatus.TODO)
+                recovered_ids.append(task.id)
+
+            self.event_bus.emit(
+                EventType.CRASH_RECOVERY_COMPLETED,
+                payload={
+                    "rollback_sha": rollback_sha,
+                    "rolled_back_dirty_tree": rolled_back,
+                    "recovered_task_ids": recovered_ids,
+                    "arch_pending_task_ids": [t.id for t in arch_pending_tasks],
+                },
+            )
+            return
+
+        # No crashed run detected: NEVER wipe dirty manual user changes!
+        if self.config.workflow.strict_clean_start and self.git_ops.has_uncommitted_changes():
+            raise OrchestratorFatalError(
+                "Target repository has uncommitted changes and no prior crashed run was detected. "
+                "Refusing to reset manual changes; commit or stash them first "
+                "(or set workflow.strict_clean_start: false)."
+            )
+
+    def _ensure_progress_file(self) -> None:
+        if not self.progress_path.exists():
+            atomic_write_text(
+                self.progress_path,
+                "# Pipeline Progress Handoff (PROGRESS.md)\n\n"
+                "Completed milestones, module summaries, and architectural notes.\n",
+            )
+
+    def _read_progress_text(self) -> str:
+        if not self.progress_path.exists():
+            return ""
+        return normalize_newlines(self.progress_path.read_text(encoding="utf-8", errors="replace"))
+
+    def _append_progress_entry(self, heading: str, body: str) -> None:
+        self._ensure_progress_file()
+        existing = self._read_progress_text().rstrip()
+        entry = f"\n\n## {heading} ({utc_now_iso()})\n\n{normalize_newlines(body).strip()}\n"
+        atomic_write_text(self.progress_path, existing + entry)
+
+    def _refresh_repo_map(self) -> str:
+        content = generate_repo_map(
+            self.repo_root,
+            self.config.project.repo_map_ignore,
+            pipeline_dir=self.config.project.pipeline_dir,
+        )
+        atomic_write_text(self.repo_map_path, content)
+        return content
+
+    def _generate_report(self) -> Path:
+        path = write_report(
+            self.report_path,
+            project_name=self.config.project.name,
+            state=self.event_bus.state,
+            tasks=self.store.list_tasks(),
+        )
+        self.event_bus.emit(EventType.REPORT_GENERATED, payload={"path": str(path)})
+        return path
+
+    def _next_attempt_dir(self, scope_id: str) -> tuple[int, Path]:
+        count = self._attempt_counter.get(scope_id, 0) + 1
+        self._attempt_counter[scope_id] = count
+        attempt_dir = self.runs_dir / scope_id / f"attempt_{count}"
+        attempt_dir.mkdir(parents=True, exist_ok=True)
+        return count, attempt_dir
+
+    def _sync_batch_queue_from_store(self) -> None:
+        pending_ids = [t.id for t in self.store.list_tasks() if t.status == TaskStatus.BATCH_PENDING]
+        self.event_bus.update_state(batch_queue=pending_ids)
+
+    def _get_batch_pending_tasks(self) -> list[Task]:
+        return [t for t in self.store.list_tasks() if t.status == TaskStatus.BATCH_PENDING]
+
+    def _must_flush_batch_before(self, next_task: Task, pending_batch: list[Task]) -> bool:
+        if next_task.complexity != TaskComplexity.EASY:
+            return True
+        batch_ids = {t.id for t in pending_batch}
+        if self.store.depends_on_any(next_task.id, batch_ids):
+            return True
+        # Check potential file overlap between next_task.allowed_paths and batch changed_files
+        batch_files: set[str] = set()
+        for b_task in pending_batch:
+            batch_files.update(b_task.changed_files)
+        if not next_task.allowed_paths:
+            return True
+        return any(matches_any_glob(bf, next_task.allowed_paths) for bf in batch_files)
+
+    # -------------------------------------------------------------------------
+    # Control Plane & Pause Handling
+    # -------------------------------------------------------------------------
+
+    def _process_control_commands(self) -> list[ControlCommand]:
+        processed_set = set(self.event_bus.state.processed_control_ids)
+        pending = self.control_plane.poll_pending(processed_set)
+        applied: list[ControlCommand] = []
+
+        for cmd, source_path in pending:
+            result_msg = self._apply_control_command(cmd)
+            completed = self.control_plane.mark_processed(cmd, source_path, result=result_msg)
+            processed_ids = [*self.event_bus.state.processed_control_ids, cmd.id][-500:]
+            self.event_bus.update_state(
+                processed_control_ids=processed_ids,
+                last_control_command_id=cmd.id,
+            )
+            self.event_bus.emit(
+                EventType.CONTROL_COMMAND_APPLIED,
+                task_id=cmd.task_id,
+                payload={
+                    "command_id": cmd.id,
+                    "action": cmd.action.value,
+                    "reason": cmd.reason,
+                    "result": result_msg,
+                },
+            )
+            applied.append(completed)
+
+        return applied
+
+    def _apply_control_command(self, cmd: ControlCommand) -> str:
+        if cmd.action == ControlAction.PAUSE_AFTER_CURRENT:
+            self.event_bus.update_state(pause_after_current=True)
+            return "scheduled pause after current step"
+
+        if cmd.action == ControlAction.RESUME:
+            self.event_bus.update_state(
+                paused=False,
+                pause_after_current=False,
+                pause_reason=None,
+                resume_at=None,
+                status=RunStatus.RUNNING,
+            )
+            self.event_bus.emit(EventType.PAUSE_RESUMED, payload={"command_id": cmd.id})
+            return "resumed"
+
+        if cmd.action == ControlAction.ABORT:
+            self._abort_requested = True
+            return "abort requested"
+
+        if cmd.action == ControlAction.RETRY_TASK:
+            if not cmd.task_id:
+                return "ignored: missing task_id"
+            try:
+                unblocked = self.store.retry_task(cmd.task_id)
+                return f"retried #{cmd.task_id}; unblocked={unblocked}"
+            except KeyError:
+                return f"ignored: unknown task_id #{cmd.task_id}"
+
+        if cmd.action == ControlAction.SKIP_TASK:
+            if not cmd.task_id:
+                return "ignored: missing task_id"
+            try:
+                reason = cmd.reason or "Skipped via control command"
+                self.store.update_status(
+                    cmd.task_id,
+                    TaskStatus.FAILED,
+                    resolution="skipped",
+                    failure_reason=reason,
+                )
+                self.store.add_comment(
+                    cmd.task_id,
+                    author="control_plane",
+                    kind="control",
+                    body=reason,
+                )
+                blocked = self.store.cascade_block_dependents(cmd.task_id)
+                return f"skipped #{cmd.task_id}; blocked={blocked}"
+            except KeyError:
+                return f"ignored: unknown task_id #{cmd.task_id}"
+
+        return "unsupported action"
+
+    def _wait_while_paused(self, *, reason: str) -> None:
+        self.event_bus.update_state(
+            status=RunStatus.PAUSED,
+            paused=True,
+            pause_reason=reason,
+            pause_after_current=False,
+        )
+        self.event_bus.emit(EventType.PAUSE_ENTERED, payload={"reason": reason})
+        while self.event_bus.state.paused and not self._abort_requested:
+            self._sleep(self.config.workflow.control_poll_seconds)
+            self._process_control_commands()
+        if not self._abort_requested:
+            self.event_bus.update_state(status=RunStatus.RUNNING)
+
+    def _wait_rate_limit_cooldown(
+        self,
+        *,
+        provider_name: str,
+        cooldown_seconds: int,
+        task_id: str | None,
+        role: AgentRole,
+    ) -> None:
+        resume_dt = self.event_bus.quota_tracker.record_rate_limit(
+            provider_name,
+            cooldown_seconds=cooldown_seconds,
+        )
+        resume_iso = resume_dt.isoformat().replace("+00:00", "Z")
+        self.event_bus.update_state(
+            status=RunStatus.PAUSED,
+            paused=True,
+            pause_reason=f"rate_limit:{provider_name}",
+            resume_at=resume_iso,
+        )
+        self.event_bus.emit(
+            EventType.PAUSE_ENTERED,
+            task_id=task_id,
+            role=role,
+            provider=provider_name,
+            payload={"reason": "rate_limit", "cooldown_seconds": cooldown_seconds, "resume_at": resume_iso},
+        )
+        while not self._abort_requested:
+            self._process_control_commands()
+            if self._abort_requested:
+                break
+            if not self.event_bus.state.paused:
+                # Operator explicitly issued `resume`
+                break
+            remaining = (resume_dt - datetime.now(UTC)).total_seconds()
+            if remaining <= 0:
+                break
+            self._sleep(min(self.config.workflow.rate_limit_poll_seconds, remaining))
+
+        if not self._abort_requested:
+            self.event_bus.update_state(
+                status=RunStatus.RUNNING,
+                paused=False,
+                pause_reason=None,
+                resume_at=None,
+            )
+            self.event_bus.emit(
+                EventType.PAUSE_RESUMED,
+                task_id=task_id,
+                role=role,
+                provider=provider_name,
+                payload={"reason": "rate_limit_complete"},
+            )
+
+    def _wait_backoff(
+        self,
+        *,
+        delay_seconds: float,
+        provider_name: str,
+        task_id: str | None,
+        role: AgentRole,
+    ) -> None:
+        """Sleep for transient backoff in short ticks, polling control_inbox for immediate abort."""
+        self.event_bus.update_state(
+            active_task_id=task_id,
+            active_phase=f"transient_backoff:{provider_name}",
+            active_role=role,
+            active_provider=provider_name,
+        )
+        poll = self.config.workflow.control_poll_seconds
+        slept_total = 0.0
+        while slept_total < delay_seconds and not self._abort_requested:
+            self._process_control_commands()
+            if self._abort_requested:
+                raise _AbortedByControlError()
+            step = min(poll, delay_seconds - slept_total)
+            if step <= 0:
+                break
+            self._sleep(step)
+            slept_total += step
+        self._process_control_commands()
+        if self._abort_requested:
+            raise _AbortedByControlError()
+
+    # -------------------------------------------------------------------------
+    # Guarded Provider Invocation (base_sha, untracked add -N, Integrity Guard)
+    # -------------------------------------------------------------------------
+
+    def _invoke_provider_guarded(
+        self,
+        *,
+        role: AgentRole,
+        built_prompt: BuiltPrompt,
+        task_id: str | None,
+        attempt_dir: Path,
+        base_sha: str,
+        task_complexity: TaskComplexity | None = None,
+        allowed_paths: list[str] | None = None,
+        preserve_existing_diff_for_readonly: bool = False,
+    ) -> tuple[ProviderResponse, DiffGuardReport]:
+        provider = self.registry.for_role(role)
+        attempt_dir.mkdir(parents=True, exist_ok=True)
+
+        # Wait if provider is currently in cooldown or reached rolling quota ceiling
+        pre_wait = self.event_bus.quota_tracker.seconds_until_available(provider.name)
+        if pre_wait > 0:
+            self._wait_rate_limit_cooldown(
+                provider_name=provider.name,
+                cooldown_seconds=pre_wait,
+                task_id=task_id,
+                role=role,
+            )
+            if self._abort_requested:
+                raise _AbortedByControlError()
+
+        # For read-only roles running on a dirty working tree (worker edits awaiting review),
+        # snapshot the exact git diff/status beforehand so we can detect ANY read-only mutation.
+        pre_head_sha = self.git_ops.get_head_sha()
+        pre_changes: list[GitChange] = []
+        pre_diff = ""
+        if role in READ_ONLY_ROLES and preserve_existing_diff_for_readonly:
+            self.git_ops.mark_untracked_intent_to_add()
+            pre_changes = self.git_ops.get_name_status(base_sha)
+            pre_diff = self.git_ops.get_diff(base_sha)
+
+        expected_head = (
+            pre_head_sha
+            if (role in READ_ONLY_ROLES and preserve_existing_diff_for_readonly)
+            else base_sha
+        )
+        retry_delays = list(self.config.workflow.transient_retry_delays_seconds)
+        transient_attempt = 0
+        readonly_timeout_retries = 0
+
+        while True:
+            self.event_bus.update_state(
+                active_task_id=task_id,
+                active_phase=f"provider:{role.value}",
+                active_role=role,
+                active_provider=provider.name,
+            )
+            self.event_bus.emit(
+                EventType.PROVIDER_INVOKED,
+                task_id=task_id,
+                role=role,
+                provider=provider.name,
+                payload={
+                    "static_prefix_sha256": built_prompt.static_prefix_sha256,
+                    "prompt_chars": len(built_prompt.full_text),
+                    "attempt_dir": str(attempt_dir),
+                },
+            )
+            self.event_bus.quota_tracker.record_request(provider.name)
+            self.event_bus.save_state()
+
+            # Integrity Guard snapshot of the entire .pipeline/ directory BEFORE agent runs
+            pipeline_snapshot_before = snapshot_directory_hashes(self.pipeline_dir)
+
+            dynamic_body = "\n\n===\n\n".join(
+                part
+                for part in (built_prompt.semi_static_layer, built_prompt.dynamic_tail)
+                if part
+            )
+            request = ProviderRequest(
+                run_id=self.event_bus.run_id,
+                task_id=task_id,
+                role=role,
+                prompt=built_prompt.full_text,
+                static_prefix=built_prompt.static_prefix,
+                dynamic_body=dynamic_body,
+                static_prefix_sha256=built_prompt.static_prefix_sha256,
+                workdir=self.repo_root,
+                timeout_seconds=provider.profile.timeout_seconds,
+                attempt_dir=attempt_dir,
+            )
+
+            # FileNotFoundError is a permanent configuration error -> fail-fast without retry
+            response = provider.invoke(request)
+
+            # Integrity Guard check AFTER agent runs (agents must NEVER touch .pipeline/)
+            pipeline_snapshot_after = snapshot_directory_hashes(self.pipeline_dir)
+            tamper_changes = diff_directory_snapshots(
+                pipeline_snapshot_before,
+                pipeline_snapshot_after,
+            )
+
+            if response.rate_limited:
+                cooldown = response.retry_after_seconds or provider.profile.rate_limit_cooldown_seconds
+                self.event_bus.emit(
+                    EventType.PROVIDER_RATE_LIMITED,
+                    task_id=task_id,
+                    role=role,
+                    provider=provider.name,
+                    payload={"cooldown_seconds": cooldown, "stderr": response.raw_stderr[:400]},
+                )
+                self._wait_rate_limit_cooldown(
+                    provider_name=provider.name,
+                    cooldown_seconds=cooldown,
+                    task_id=task_id,
+                    role=role,
+                )
+                if self._abort_requested:
+                    raise _AbortedByControlError()
+                continue
+
+            failure_kind = classify_provider_failure(response)
+
+            if failure_kind == "timeout":
+                if (
+                    role in READ_ONLY_ROLES
+                    and not tamper_changes
+                    and readonly_timeout_retries < self.config.workflow.retry_on_timeout_readonly
+                ):
+                    if self.git_ops.restore_soft_to_base(expected_head):
+                        self.event_bus.emit(
+                            EventType.AGENT_COMMIT_SOFT_RESET,
+                            task_id=task_id,
+                            role=role,
+                            provider=provider.name,
+                            payload={"restored_to_sha": expected_head},
+                        )
+                    delay = (
+                        retry_delays[min(readonly_timeout_retries, len(retry_delays) - 1)]
+                        if retry_delays
+                        else 0
+                    )
+                    readonly_timeout_retries += 1
+                    self.event_bus.emit(
+                        EventType.PROVIDER_TRANSIENT_RETRY,
+                        task_id=task_id,
+                        role=role,
+                        provider=provider.name,
+                        payload={
+                            "attempt": readonly_timeout_retries,
+                            "max_attempts": self.config.workflow.retry_on_timeout_readonly,
+                            "reason": "readonly_timeout",
+                            "delay_seconds": delay,
+                        },
+                    )
+                    self._wait_backoff(
+                        delay_seconds=delay,
+                        provider_name=provider.name,
+                        task_id=task_id,
+                        role=role,
+                    )
+                    continue
+                # Writing roles on timeout do NOT blindly loop; soft-reset runs below and returns upward
+                break
+
+            if failure_kind == "permanent":
+                # Fail-fast without retries for 401/403/invalid CLI option/command not found
+                break
+
+            if (
+                failure_kind == "transient"
+                and not tamper_changes
+                and transient_attempt < len(retry_delays)
+            ):
+                if self.git_ops.restore_soft_to_base(expected_head):
+                    self.event_bus.emit(
+                        EventType.AGENT_COMMIT_SOFT_RESET,
+                        task_id=task_id,
+                        role=role,
+                        provider=provider.name,
+                        payload={"restored_to_sha": expected_head},
+                    )
+                delay = retry_delays[transient_attempt]
+                transient_attempt += 1
+                reason_snippet = (response.raw_stderr or response.raw_stdout).strip()[:200] or (
+                    f"exit_code={response.exit_code}"
+                )
+                self.event_bus.emit(
+                    EventType.PROVIDER_TRANSIENT_RETRY,
+                    task_id=task_id,
+                    role=role,
+                    provider=provider.name,
+                    payload={
+                        "attempt": transient_attempt,
+                        "max_attempts": len(retry_delays),
+                        "reason": reason_snippet,
+                        "delay_seconds": delay,
+                        "exit_code": response.exit_code,
+                    },
+                )
+                self._wait_backoff(
+                    delay_seconds=delay,
+                    provider_name=provider.name,
+                    task_id=task_id,
+                    role=role,
+                )
+                continue
+
+            break
+
+        # Guard #2: Detect unauthorized agent commits and soft-reset back to base_sha
+        if self.git_ops.restore_soft_to_base(expected_head):
+            self.event_bus.emit(
+                EventType.AGENT_COMMIT_SOFT_RESET,
+                task_id=task_id,
+                role=role,
+                provider=provider.name,
+                payload={"restored_to_sha": expected_head},
+            )
+
+        # Guard #3: Mark all newly created untracked files with `git add -N`
+        self.git_ops.mark_untracked_intent_to_add()
+        post_changes = self.git_ops.get_name_status(base_sha)
+        post_diff = self.git_ops.get_diff(base_sha)
+
+        # Guard #4: Role-aware Diff Guard
+        if role in READ_ONLY_ROLES and preserve_existing_diff_for_readonly:
+            mutated = (post_changes != pre_changes) or (post_diff != pre_diff)
+            if mutated:
+                delta_changes = [c for c in post_changes if c not in pre_changes] or post_changes
+                guard_report = evaluate_diff(
+                    role=role,
+                    changes=delta_changes,
+                    raw_diff=post_diff,
+                    config=self.config,
+                )
+            else:
+                guard_report = evaluate_diff(
+                    role=role,
+                    changes=[],
+                    raw_diff="",
+                    config=self.config,
+                )
+        else:
+            guard_report = evaluate_diff(
+                role=role,
+                changes=post_changes,
+                raw_diff=post_diff,
+                config=self.config,
+                task_complexity=task_complexity,
+                allowed_paths=allowed_paths,
+            )
+
+        if tamper_changes:
+            for item in tamper_changes:
+                guard_report.red_violations.append(
+                    GuardViolation(
+                        code="RED_ZONE_PIPELINE_TAMPERED",
+                        path=f"{self.config.project.pipeline_dir}/{item}",
+                        line=None,
+                        message=f"Agent modified forbidden orchestrator directory: {item}",
+                    )
+                )
+            guard_report.passed = False
+
+        # Persist artifacts strictly by the orchestrator (never by the agent)
+        self._write_attempt_artifacts(
+            attempt_dir=attempt_dir,
+            role=role,
+            response=response,
+            guard_report=guard_report,
+        )
+
+        if response.exit_code == 0 and not response.timed_out:
+            self.event_bus.emit(
+                EventType.PROVIDER_SUCCEEDED,
+                task_id=task_id,
+                role=role,
+                provider=provider.name,
+                payload={
+                    "duration_seconds": round(response.duration_seconds, 2),
+                    "changed_files": guard_report.changed_files,
+                },
+            )
+        else:
+            self.event_bus.emit(
+                EventType.PROVIDER_FAILED,
+                task_id=task_id,
+                role=role,
+                provider=provider.name,
+                payload={
+                    "exit_code": response.exit_code,
+                    "timed_out": response.timed_out,
+                    "stderr_tail": response.raw_stderr[-400:],
+                },
+            )
+
+        return response, guard_report
+
+    def _write_attempt_artifacts(
+        self,
+        *,
+        attempt_dir: Path,
+        role: AgentRole,
+        response: ProviderResponse,
+        guard_report: DiffGuardReport,
+    ) -> None:
+        raw_combined = response.raw_stdout
+        if response.raw_stderr:
+            raw_combined = (
+                f"{raw_combined}\n\n=== STDERR ===\n{response.raw_stderr}"
+                if raw_combined
+                else f"=== STDERR ===\n{response.raw_stderr}"
+            )
+        atomic_write_text(attempt_dir / "raw_output.txt", raw_combined)
+        atomic_write_text(attempt_dir / "diff.patch", guard_report.filtered_diff)
+
+        parsed_payload: dict[str, Any] = {
+            "role": role.value,
+            "provider": response.provider_name,
+            "exit_code": response.exit_code,
+            "timed_out": response.timed_out,
+            "duration_seconds": response.duration_seconds,
+            "parsed_text": response.parsed_text,
+            "guard_passed": guard_report.passed,
+            "changed_files": guard_report.changed_files,
+            "touched_yellow_zone": guard_report.touched_yellow_zone,
+            "violations": [
+                {"code": v.code, "path": v.path, "line": v.line, "message": v.message}
+                for v in guard_report.all_violations
+            ],
+        }
+        if role not in READ_ONLY_ROLES:
+            worker_parsed = parse_worker_output(response.parsed_text)
+            parsed_payload["worker_status"] = worker_parsed.status.value
+            parsed_payload["progress_update"] = worker_parsed.progress_update
+            parsed_payload["escalation_summary"] = worker_parsed.escalation_summary
+            atomic_write_text(attempt_dir / "last_report.md", worker_parsed.report + "\n")
+        else:
+            atomic_write_text(attempt_dir / "last_report.md", response.parsed_text + "\n")
+
+        atomic_write_json(attempt_dir / "parsed_output.json", parsed_payload)
+
+    # -------------------------------------------------------------------------
+    # Task Execution Lifecycle
+    # -------------------------------------------------------------------------
+
+    def _worker_role_for(self, complexity: TaskComplexity) -> AgentRole:
+        if complexity == TaskComplexity.EASY:
+            return AgentRole.WORKER_EASY
+        if complexity == TaskComplexity.HARD:
+            return AgentRole.WORKER_HARD
+        return AgentRole.WORKER_MEDIUM
+
+    def _transition_task(self, task_id: str, status: TaskStatus, **fields: Any) -> Task:
+        prev = self.store.get_task(task_id).status
+        updated = self.store.update_status(task_id, status, **fields)
+        self.event_bus.emit(
+            EventType.TASK_STATUS_CHANGED,
+            task_id=task_id,
+            payload={"from": prev.value, "to": status.value},
+        )
+        return updated
+
+    def _execute_task(self, task: Task) -> None:
+        # Clean up lingering dev-server/test ports before starting the task
+        if self.config.workflow.cleanup_ports:
+            cleanup_ports(self.config.workflow.cleanup_ports)
+
+        repo_map_text = self._refresh_repo_map()
+        inbox_text = self.inbox_manager.consume(task_id=task.id)
+        if inbox_text:
+            self.event_bus.emit(
+                EventType.INBOX_CONSUMED,
+                task_id=task.id,
+                payload={"chars": len(inbox_text)},
+            )
+
+        task_base_sha = self.git_ops.get_head_sha()
+        worker_role = self._worker_role_for(task.complexity)
+        worker_profile = self.registry.for_role(worker_role).profile
+
+        self.event_bus.update_state(
+            active_task_id=task.id,
+            active_task_base_sha=task_base_sha,
+            active_phase="task_claimed",
+        )
+        self.event_bus.emit(
+            EventType.TASK_CLAIMED,
+            task_id=task.id,
+            role=worker_role,
+            provider=self.registry.profile_name_for_role(worker_role),
+            payload={"complexity": task.complexity.value, "base_sha": task_base_sha},
+        )
+        task = self._transition_task(task.id, TaskStatus.IN_PROGRESS)
+
+        # Carry over previous rejection comments (e.g., if returned from batch review)
+        prior_rejections = [c.body for c in task.comments if c.kind == "rejection"]
+        review_feedback: str | None = prior_rejections[-1] if prior_rejections else None
+        prior_arch = [c.body for c in task.comments if c.kind == "architect"]
+        architect_notes: str | None = prior_arch[-1] if prior_arch else None
+        gate_error_log: str | None = None
+        guard_error_text: str | None = None
+
+        max_rounds = self.config.workflow.max_review_rounds
+        max_gate_retries = self.config.workflow.max_gate_retries_per_round
+
+        while task.review_rounds < max_rounds:
+            self._process_control_commands()
+            if self._abort_requested:
+                self.git_ops.hard_rollback(task_base_sha)
+                raise _AbortedByControlError()
+
+            gates_passed_this_round = False
+            last_guard_report: DiffGuardReport | None = None
+            last_worker_parsed: ParsedWorkerOutput | None = None
+
+            for _gate_try in range(max_gate_retries):
+                task = self.store.update_task_fields(task.id, attempts=task.attempts + 1)
+                _, attempt_dir = self._next_attempt_dir(task.id)
+
+                progress_text = self._read_progress_text()
+                repo_map_text = self._refresh_repo_map()
+                extra_inst = (
+                    f"Architect resolution guidance:\n{architect_notes}" if architect_notes else None
+                )
+                built_prompt = self.prompt_builder.build(
+                    role=worker_role,
+                    profile=worker_profile,
+                    repo_map_text=repo_map_text,
+                    progress_text=progress_text,
+                    task=task,
+                    inbox_text=inbox_text,
+                    gate_error_log=gate_error_log,
+                    guard_error_text=guard_error_text,
+                    review_feedback=review_feedback,
+                    extra_instructions=extra_inst,
+                )
+
+                response, guard_report = self._invoke_provider_guarded(
+                    role=worker_role,
+                    built_prompt=built_prompt,
+                    task_id=task.id,
+                    attempt_dir=attempt_dir,
+                    base_sha=task_base_sha,
+                    task_complexity=task.complexity,
+                    allowed_paths=task.allowed_paths,
+                )
+                last_guard_report = guard_report
+                parsed = parse_worker_output(response.parsed_text)
+                last_worker_parsed = parsed
+
+                # Reset one-shot error messages once passed to worker
+                gate_error_log = None
+                guard_error_text = None
+
+                # 1. Immediate rollback on Red Zone violation (existing test M/D, protected files, .pipeline tamper)
+                if guard_report.red_violations:
+                    self.event_bus.emit(
+                        EventType.RED_ZONE_VIOLATION,
+                        task_id=task.id,
+                        role=worker_role,
+                        provider=response.provider_name,
+                        payload={
+                            "violations": [
+                                {"code": v.code, "path": v.path, "message": v.message}
+                                for v in guard_report.red_violations
+                            ]
+                        },
+                    )
+                    self.git_ops.hard_rollback(task_base_sha)
+                    self.event_bus.emit(
+                        EventType.TASK_ROLLED_BACK,
+                        task_id=task.id,
+                        payload={"reason": "red_zone_violation", "base_sha": task_base_sha},
+                    )
+                    guard_error_text = (
+                        "Your previous attempt was ROLLED BACK because of a Red Zone violation:\n"
+                        + guard_report.summary_text()
+                    )
+                    task = self._transition_task(task.id, TaskStatus.GATES_FAILED)
+                    task = self._transition_task(task.id, TaskStatus.IN_PROGRESS)
+                    continue
+
+                # 2. Architectural escalation protocol (STATUS: NEEDS_ARCH_CHANGE)
+                if parsed.status == WorkerStatus.NEEDS_ARCH_CHANGE:
+                    self.git_ops.hard_rollback(task_base_sha)
+                    new_base, guidance, resolved = self._handle_escalation(
+                        task=task,
+                        worker_output=parsed,
+                        base_sha=task_base_sha,
+                    )
+                    if not resolved:
+                        self._fail_task_and_rollback(
+                            task,
+                            task_base_sha,
+                            reason=f"Architect could not resolve escalation: {guidance}",
+                        )
+                        return
+                    task_base_sha = new_base
+                    self.event_bus.update_state(active_task_base_sha=task_base_sha)
+                    architect_notes = guidance
+                    task = self._transition_task(task.id, TaskStatus.IN_PROGRESS)
+                    continue
+
+                # 3. Provider execution error / timeout
+                if response.timed_out or response.exit_code != 0:
+                    guard_error_text = (
+                        f"Provider execution failed (exit_code={response.exit_code}, "
+                        f"timed_out={response.timed_out}). Fix and complete the task.\n"
+                        f"{response.raw_stderr[-500:]}"
+                    )
+                    task = self._transition_task(task.id, TaskStatus.GATES_FAILED)
+                    task = self._transition_task(task.id, TaskStatus.IN_PROGRESS)
+                    continue
+
+                # 4. Placeholder Guard & Diff Guard / Scope checks (0 tokens)
+                if not guard_report.passed:
+                    if guard_report.placeholder_violations:
+                        self.event_bus.emit(
+                            EventType.PLACEHOLDER_GUARD_FAILED,
+                            task_id=task.id,
+                            role=worker_role,
+                            payload={
+                                "count": len(guard_report.placeholder_violations),
+                                "details": [v.message for v in guard_report.placeholder_violations[:10]],
+                            },
+                        )
+                    if guard_report.scope_violations or guard_report.limit_violations:
+                        self.event_bus.emit(
+                            EventType.DIFF_GUARD_FAILED,
+                            task_id=task.id,
+                            role=worker_role,
+                            payload={
+                                "details": [
+                                    v.message
+                                    for v in [
+                                        *guard_report.scope_violations,
+                                        *guard_report.limit_violations,
+                                    ]
+                                ]
+                            },
+                        )
+                    guard_error_text = guard_report.summary_text()
+                    task = self._transition_task(task.id, TaskStatus.GATES_FAILED)
+                    task = self._transition_task(task.id, TaskStatus.IN_PROGRESS)
+                    continue
+
+                # 5. Free local gates (lint, typecheck, build, tests, Playwright, verify_cmd)
+                self.event_bus.update_state(active_phase="gates", active_task_id=task.id)
+                self.event_bus.emit(EventType.GATE_STARTED, task_id=task.id)
+                gates_res = self.gate_runner.run_all(
+                    attempt_dir=attempt_dir,
+                    verify_cmd=task.verify_cmd,
+                    fail_fast=True,
+                )
+                atomic_write_text(attempt_dir / "gates.log", gates_res.combined_trimmed_log + "\n")
+
+                if not gates_res.passed:
+                    failed_names = [r.name for r in gates_res.results if not r.passed and not r.optional]
+                    self.event_bus.emit(
+                        EventType.GATE_FAILED,
+                        task_id=task.id,
+                        payload={
+                            "failed_gates": failed_names,
+                            "screenshots": gates_res.screenshots,
+                            "log_path": str(attempt_dir / "gates.log"),
+                        },
+                    )
+                    gate_error_log = gates_res.combined_trimmed_log
+                    task = self._transition_task(task.id, TaskStatus.GATES_FAILED)
+                    task = self._transition_task(task.id, TaskStatus.IN_PROGRESS)
+                    continue
+
+                self.event_bus.emit(
+                    EventType.GATE_PASSED,
+                    task_id=task.id,
+                    payload={
+                        "gates": [r.name for r in gates_res.results],
+                        "screenshots": gates_res.screenshots,
+                    },
+                )
+                gates_passed_this_round = True
+                break
+
+            # If gates/guards never passed in this round -> count as a failed round
+            if not gates_passed_this_round or last_guard_report is None or last_worker_parsed is None:
+                new_rounds = task.review_rounds + 1
+                task = self.store.update_task_fields(task.id, review_rounds=new_rounds)
+                if (
+                    task.complexity == TaskComplexity.HARD
+                    and new_rounds == self.config.workflow.hard_split_after_rounds
+                    and self._try_split_hard_task(task, task_base_sha)
+                ):
+                    return
+                if new_rounds >= max_rounds:
+                    self._fail_task_and_rollback(
+                        task,
+                        task_base_sha,
+                        reason=f"Exceeded {max_rounds} rounds failing guards/gates.",
+                    )
+                    return
+                continue
+
+            if last_guard_report.touched_yellow_zone:
+                self.event_bus.emit(
+                    EventType.YELLOW_ZONE_TRIGGERED,
+                    task_id=task.id,
+                    payload={"yellow_files": last_guard_report.yellow_files},
+                )
+
+            # Route A: Easy task without Yellow Zone & without file overlap with existing batch -> BATCH_PENDING
+            existing_batch_files = {
+                fp for bt in self._get_batch_pending_tasks() for fp in bt.changed_files
+            }
+            overlaps_batch = not existing_batch_files.isdisjoint(set(last_guard_report.changed_files))
+
+            if (
+                task.complexity == TaskComplexity.EASY
+                and not last_guard_report.touched_yellow_zone
+                and not overlaps_batch
+                and self.config.workflow.batch_review_size > 1
+            ):
+                wip_sha: str | None = None
+                if last_guard_report.changed_files and self.config.workflow.auto_commit:
+                    wip_sha = self.git_ops.commit_all(f"wip(task-{task.id}): {task.title}")
+                    self.event_bus.emit(
+                        EventType.GIT_COMMITTED,
+                        task_id=task.id,
+                        payload={"commit_sha": wip_sha, "wip": True},
+                    )
+                # IMPORTANT: Do NOT update PROGRESS.md yet — only after Master APPROVE!
+                pending_progress = last_worker_parsed.progress_update or (
+                    f"Completed `#{task.id}` ({task.title}). "
+                    f"Files: {', '.join(last_guard_report.changed_files) or 'none'}."
+                )
+                self._batch_diffs[task.id] = last_guard_report.filtered_diff
+                self._transition_task(
+                    task.id,
+                    TaskStatus.BATCH_PENDING,
+                    wip_commit_sha=wip_sha,
+                    changed_files=last_guard_report.changed_files,
+                    touched_yellow_zone=False,
+                    pending_progress_note=pending_progress,
+                    last_report=last_worker_parsed.report,
+                )
+                self._sync_batch_queue_from_store()
+                return
+
+            # Route B: Medium, Hard, or Yellow-Zone-triggered Easy -> Individual review
+            task = self._transition_task(
+                task.id,
+                TaskStatus.NEEDS_REVIEW,
+                changed_files=last_guard_report.changed_files,
+                touched_yellow_zone=last_guard_report.touched_yellow_zone,
+                last_report=last_worker_parsed.report,
+            )
+
+            # B1. Evil Pre-Reviewer for medium/hard tasks (saves Master quota)
+            if task.complexity in (TaskComplexity.MEDIUM, TaskComplexity.HARD):
+                pre_ok, pre_feedback = self._run_single_review(
+                    role=AgentRole.PRE_REVIEWER,
+                    task=task,
+                    filtered_diff=last_guard_report.filtered_diff,
+                    last_report=last_worker_parsed.report,
+                    base_sha=task_base_sha,
+                    repo_map_text=repo_map_text,
+                )
+                if not pre_ok:
+                    review_feedback = pre_feedback
+                    self.store.add_comment(
+                        task.id,
+                        author="pre_reviewer",
+                        kind="rejection",
+                        body=pre_feedback,
+                    )
+                    new_rounds = task.review_rounds + 1
+                    task = self.store.update_task_fields(task.id, review_rounds=new_rounds)
+                    if (
+                        task.complexity == TaskComplexity.HARD
+                        and new_rounds == self.config.workflow.hard_split_after_rounds
+                        and self._try_split_hard_task(task, task_base_sha)
+                    ):
+                        return
+                    if new_rounds >= max_rounds:
+                        self._fail_task_and_rollback(
+                            task,
+                            task_base_sha,
+                            reason=f"Rejected by pre_reviewer after {max_rounds} rounds: {pre_feedback[:240]}",
+                        )
+                        return
+                    task = self._transition_task(task.id, TaskStatus.IN_PROGRESS)
+                    continue
+
+            # B2. Master Reviewer
+            master_ok, master_feedback = self._run_single_review(
+                role=AgentRole.REVIEWER,
+                task=task,
+                filtered_diff=last_guard_report.filtered_diff,
+                last_report=last_worker_parsed.report,
+                base_sha=task_base_sha,
+                repo_map_text=repo_map_text,
+            )
+            if master_ok:
+                final_sha: str | None = None
+                if last_guard_report.changed_files and self.config.workflow.auto_commit:
+                    prefix = self.config.workflow.commit_prefix
+                    final_sha = self.git_ops.commit_all(f"{prefix}(task-{task.id}): {task.title}")
+                    self.event_bus.emit(
+                        EventType.GIT_COMMITTED,
+                        task_id=task.id,
+                        payload={"commit_sha": final_sha, "wip": False},
+                    )
+                progress_note = last_worker_parsed.progress_update or (
+                    f"Completed `#{task.id}` ({task.title}). "
+                    f"Files: {', '.join(last_guard_report.changed_files) or 'none'}."
+                )
+                self._append_progress_entry(f"Task #{task.id}: {task.title}", progress_note)
+                self._transition_task(
+                    task.id,
+                    TaskStatus.DONE,
+                    resolution="completed",
+                    final_commit_sha=final_sha,
+                    changed_files=last_guard_report.changed_files,
+                    touched_yellow_zone=last_guard_report.touched_yellow_zone,
+                    last_report=last_worker_parsed.report,
+                )
+                self.event_bus.update_state(
+                    accepted_since_last_refactor=self.event_bus.state.accepted_since_last_refactor + 1
+                )
+                return
+
+            # Rejected by Master
+            review_feedback = master_feedback
+            self.store.add_comment(
+                task.id,
+                author="reviewer",
+                kind="rejection",
+                body=master_feedback,
+            )
+            new_rounds = task.review_rounds + 1
+            task = self.store.update_task_fields(task.id, review_rounds=new_rounds)
+            if (
+                task.complexity == TaskComplexity.HARD
+                and new_rounds == self.config.workflow.hard_split_after_rounds
+                and self._try_split_hard_task(task, task_base_sha)
+            ):
+                return
+            if new_rounds >= max_rounds:
+                self._fail_task_and_rollback(
+                    task,
+                    task_base_sha,
+                    reason=f"Rejected by reviewer after {max_rounds} rounds: {master_feedback[:240]}",
+                )
+                return
+            task = self._transition_task(task.id, TaskStatus.IN_PROGRESS)
+
+    def _run_single_review(
+        self,
+        *,
+        role: AgentRole,
+        task: Task,
+        filtered_diff: str,
+        last_report: str,
+        base_sha: str,
+        repo_map_text: str,
+    ) -> tuple[bool, str]:
+        _, attempt_dir = self._next_attempt_dir(f"{task.id}_{role.value}")
+        profile = self.registry.for_role(role).profile
+        built_prompt = self.prompt_builder.build(
+            role=role,
+            profile=profile,
+            repo_map_text=repo_map_text,
+            progress_text=self._read_progress_text(),
+            task=task,
+            filtered_diff=filtered_diff,
+            last_report=last_report,
+        )
+        response, guard_report = self._invoke_provider_guarded(
+            role=role,
+            built_prompt=built_prompt,
+            task_id=task.id,
+            attempt_dir=attempt_dir,
+            base_sha=base_sha,
+            preserve_existing_diff_for_readonly=True,
+        )
+        if not guard_report.passed:
+            self.event_bus.emit(
+                EventType.RED_ZONE_VIOLATION,
+                task_id=task.id,
+                role=role,
+                provider=response.provider_name,
+                payload={"reason": "read_only_role_modified_files", "details": guard_report.summary_text()},
+            )
+            self.git_ops.hard_rollback(base_sha)
+            raise OrchestratorFatalError(
+                f"Read-only role '{role.value}' modified repository files during review of #{task.id}: "
+                f"{guard_report.summary_text()}"
+            )
+
+        verdict = parse_single_review_verdict(response.parsed_text, task.id)
+        event_type = (
+            EventType.PRE_REVIEW_COMPLETED
+            if role == AgentRole.PRE_REVIEWER
+            else EventType.REVIEW_COMPLETED
+        )
+        self.event_bus.emit(
+            event_type,
+            task_id=task.id,
+            role=role,
+            provider=response.provider_name,
+            payload={"verdict": verdict.verdict.value},
+        )
+        if response.exit_code != 0 or response.timed_out:
+            raise _PausedByInfraError(
+                reason=(
+                    f"{role.value} provider '{response.provider_name}' failed "
+                    f"(exit_code={response.exit_code}, timed_out={response.timed_out})"
+                ),
+                task_id=task.id,
+                role=role,
+                provider=response.provider_name,
+            )
+        return verdict.verdict == ReviewVerdictType.APPROVE, verdict.feedback
+
+    # -------------------------------------------------------------------------
+    # Batch Review (Easy Independent Tasks)
+    # -------------------------------------------------------------------------
+
+    def _flush_batch_review(self) -> None:
+        batch_tasks = self._get_batch_pending_tasks()
+        if not batch_tasks:
+            return
+
+        task_ids = [t.id for t in batch_tasks]
+        self.event_bus.emit(
+            EventType.BATCH_REVIEW_STARTED,
+            role=AgentRole.REVIEWER,
+            provider=self.registry.profile_name_for_role(AgentRole.REVIEWER),
+            payload={"task_ids": task_ids},
+        )
+
+        batch_items: list[tuple[Task, str, str]] = []
+        for task in batch_tasks:
+            diff_text = self._batch_diffs.get(task.id, "")
+            if not diff_text and task.wip_commit_sha:
+                # Reconstruct diff from commit if resumed across runs
+                res = self.git_ops._run(["show", "--format=", task.wip_commit_sha], check=False)
+                if res.exit_code == 0:
+                    diff_text = res.stdout
+            batch_items.append((task, diff_text, task.last_report or ""))
+
+        _, attempt_dir = self._next_attempt_dir("batch_review")
+        base_sha = self.git_ops.get_head_sha()
+        reviewer_profile = self.registry.for_role(AgentRole.REVIEWER).profile
+        built_prompt = self.prompt_builder.build(
+            role=AgentRole.REVIEWER,
+            profile=reviewer_profile,
+            repo_map_text=self._refresh_repo_map(),
+            progress_text=self._read_progress_text(),
+            batch_items=batch_items,
+        )
+
+        response, guard_report = self._invoke_provider_guarded(
+            role=AgentRole.REVIEWER,
+            built_prompt=built_prompt,
+            task_id=",".join(task_ids),
+            attempt_dir=attempt_dir,
+            base_sha=base_sha,
+        )
+        if not guard_report.passed:
+            self.event_bus.emit(
+                EventType.RED_ZONE_VIOLATION,
+                role=AgentRole.REVIEWER,
+                provider=response.provider_name,
+                payload={"reason": "batch_reviewer_modified_files", "details": guard_report.summary_text()},
+            )
+            self.git_ops.hard_rollback(base_sha)
+            raise OrchestratorFatalError(
+                f"Read-only batch reviewer modified repository files: {guard_report.summary_text()}"
+            )
+
+        # Do NOT falsely revert valid batch tasks when the reviewer provider fails due to infra/config error
+        if response.exit_code != 0 or response.timed_out:
+            self.event_bus.emit(
+                EventType.BATCH_REVIEW_DEFERRED,
+                task_id=",".join(task_ids),
+                role=AgentRole.REVIEWER,
+                provider=response.provider_name,
+                payload={
+                    "task_ids": task_ids,
+                    "exit_code": response.exit_code,
+                    "timed_out": response.timed_out,
+                    "stderr_tail": response.raw_stderr[-300:],
+                },
+            )
+            raise _PausedByInfraError(
+                reason=(
+                    f"batch_reviewer provider '{response.provider_name}' failed "
+                    f"(exit_code={response.exit_code}, timed_out={response.timed_out}); "
+                    f"tasks kept in batch_pending"
+                ),
+                task_id=",".join(task_ids),
+                role=AgentRole.REVIEWER,
+                provider=response.provider_name,
+            )
+
+        verdicts = parse_batch_review_verdicts(response.parsed_text, task_ids)
+
+        for task in batch_tasks:
+            verdict = verdicts[task.id]
+            self.event_bus.emit(
+                EventType.BATCH_VERDICT_RECEIVED,
+                task_id=task.id,
+                role=AgentRole.REVIEWER,
+                provider=response.provider_name,
+                payload={"verdict": verdict.verdict.value},
+            )
+            self._batch_diffs.pop(task.id, None)
+
+            if verdict.verdict == ReviewVerdictType.APPROVE:
+                # Update PROGRESS.md ONLY after APPROVE (never at wip-commit time)
+                note = task.pending_progress_note or (
+                    f"Completed `#{task.id}` ({task.title}). "
+                    f"Files: {', '.join(task.changed_files) or 'none'}."
+                )
+                self._append_progress_entry(f"Task #{task.id}: {task.title}", note)
+                self._transition_task(
+                    task.id,
+                    TaskStatus.DONE,
+                    resolution="completed",
+                    final_commit_sha=task.wip_commit_sha,
+                    pending_progress_note=None,
+                )
+                self.event_bus.update_state(
+                    accepted_since_last_refactor=self.event_bus.state.accepted_since_last_refactor + 1
+                )
+            else:
+                # Selectively revert ONLY the rejected task's commit without touching approved tasks
+                if task.wip_commit_sha:
+                    try:
+                        revert_sha = self.git_ops.revert_commit(task.wip_commit_sha)
+                        self.event_bus.emit(
+                            EventType.GIT_REVERTED,
+                            task_id=task.id,
+                            payload={
+                                "reverted_commit": task.wip_commit_sha,
+                                "revert_commit": revert_sha,
+                            },
+                        )
+                    except GitOperationError as exc:
+                        raise OrchestratorFatalError(
+                            f"Cannot cleanly revert rejected batch task #{task.id}: {exc}"
+                        ) from exc
+
+                self.store.add_comment(
+                    task.id,
+                    author="reviewer",
+                    kind="rejection",
+                    body=verdict.feedback or "Rejected during batch review.",
+                )
+                new_rounds = task.review_rounds + 1
+                if new_rounds >= self.config.workflow.max_review_rounds:
+                    self._transition_task(
+                        task.id,
+                        TaskStatus.FAILED,
+                        review_rounds=new_rounds,
+                        wip_commit_sha=None,
+                        pending_progress_note=None,
+                        failure_reason=f"Rejected in batch review after {new_rounds} rounds: {verdict.feedback[:200]}",
+                    )
+                    self.store.cascade_block_dependents(task.id)
+                else:
+                    self._transition_task(
+                        task.id,
+                        TaskStatus.TODO,
+                        review_rounds=new_rounds,
+                        wip_commit_sha=None,
+                        pending_progress_note=None,
+                    )
+
+        self._sync_batch_queue_from_store()
+
+    # -------------------------------------------------------------------------
+    # Architectural Escalation (STATUS: NEEDS_ARCH_CHANGE)
+    # -------------------------------------------------------------------------
+
+    def _resume_arch_pending_task(self, task: Task) -> None:
+        """Resume an ARCH_PENDING task left over from a prior crashed run."""
+        base_sha = self.git_ops.get_head_sha()
+        self.event_bus.update_state(
+            active_task_id=task.id,
+            active_task_base_sha=base_sha,
+            active_phase="arch_pending_resume",
+        )
+        escalation_comments = [c.body for c in task.comments if c.kind == "escalation"]
+        details = escalation_comments[-1] if escalation_comments else task.description
+        _, guidance, resolved = self._invoke_architect_for_escalation(
+            task=task,
+            details=details,
+            base_sha=base_sha,
+        )
+        if not resolved:
+            self._fail_task_and_rollback(
+                task,
+                base_sha,
+                reason=f"Architect could not resolve escalation: {guidance}",
+            )
+            return
+        self._transition_task(task.id, TaskStatus.TODO)
+
+    def _handle_escalation(
+        self,
+        *,
+        task: Task,
+        worker_output: ParsedWorkerOutput,
+        base_sha: str,
+    ) -> tuple[str, str, bool]:
+        details = worker_output.escalation_details or worker_output.report
+        self.store.add_comment(
+            task.id,
+            author="worker",
+            kind="escalation",
+            body=details,
+        )
+        self._transition_task(task.id, TaskStatus.ARCH_PENDING)
+        self.event_bus.emit(
+            EventType.ESCALATION_TRIGGERED,
+            task_id=task.id,
+            role=AgentRole.ARCHITECT,
+            provider=self.registry.profile_name_for_role(AgentRole.ARCHITECT),
+            payload={"summary": worker_output.escalation_summary or details[:200]},
+        )
+        return self._invoke_architect_for_escalation(
+            task=task,
+            details=details,
+            base_sha=base_sha,
+        )
+
+    def _invoke_architect_for_escalation(
+        self,
+        *,
+        task: Task,
+        details: str,
+        base_sha: str,
+    ) -> tuple[str, str, bool]:
+        self.event_bus.update_state(
+            active_task_id=task.id,
+            active_task_base_sha=base_sha,
+        )
+        _, attempt_dir = self._next_attempt_dir(f"{task.id}_architect")
+        arch_profile = self.registry.for_role(AgentRole.ARCHITECT).profile
+        built_prompt = self.prompt_builder.build(
+            role=AgentRole.ARCHITECT,
+            profile=arch_profile,
+            repo_map_text=self._refresh_repo_map(),
+            progress_text=self._read_progress_text(),
+            task=task,
+            escalation_context=details,
+        )
+
+        response, guard_report = self._invoke_provider_guarded(
+            role=AgentRole.ARCHITECT,
+            built_prompt=built_prompt,
+            task_id=task.id,
+            attempt_dir=attempt_dir,
+            base_sha=base_sha,
+        )
+
+        if (response.exit_code != 0 or response.timed_out) and guard_report.passed:
+            self.git_ops.hard_rollback(base_sha)
+            raise _PausedByInfraError(
+                reason=(
+                    f"architect provider '{response.provider_name}' failed "
+                    f"(exit_code={response.exit_code}, timed_out={response.timed_out}); "
+                    f"task #{task.id} remains arch_pending"
+                ),
+                task_id=task.id,
+                role=AgentRole.ARCHITECT,
+                provider=response.provider_name,
+            )
+
+        if not guard_report.passed:
+            self.git_ops.hard_rollback(base_sha)
+            return base_sha, guard_report.summary_text() or "Architect violated Diff Guard", False
+
+        new_base_sha = base_sha
+        if guard_report.changed_files:
+            gates_res = self.gate_runner.run_all(attempt_dir=attempt_dir, fail_fast=True)
+            atomic_write_text(attempt_dir / "gates.log", gates_res.combined_trimmed_log + "\n")
+            if not gates_res.passed:
+                self.git_ops.hard_rollback(base_sha)
+                return base_sha, f"Architect changes failed gates:\n{gates_res.combined_trimmed_log}", False
+            if self.config.workflow.auto_commit:
+                new_base_sha = self.git_ops.commit_all(f"arch(task-{task.id}): resolve escalation")
+                self.event_bus.emit(
+                    EventType.GIT_COMMITTED,
+                    task_id=task.id,
+                    role=AgentRole.ARCHITECT,
+                    payload={"commit_sha": new_base_sha, "kind": "architect"},
+                )
+
+        arch_parsed = parse_worker_output(response.parsed_text)
+        guidance = arch_parsed.report or response.parsed_text
+        if arch_parsed.progress_update:
+            self._append_progress_entry(
+                f"Architect Resolution for #{task.id}",
+                arch_parsed.progress_update,
+            )
+        elif guard_report.changed_files:
+            self._append_progress_entry(
+                f"Architect Resolution for #{task.id}",
+                f"Updated shared files: {', '.join(guard_report.changed_files)}.\n\n{guidance[:500]}",
+            )
+
+        self.store.add_comment(
+            task.id,
+            author="architect",
+            kind="architect",
+            body=guidance,
+        )
+        self.event_bus.emit(
+            EventType.ARCHITECT_RESOLVED,
+            task_id=task.id,
+            role=AgentRole.ARCHITECT,
+            provider=response.provider_name,
+            payload={"changed_files": guard_report.changed_files, "new_base_sha": new_base_sha},
+        )
+        return new_base_sha, guidance, True
+
+    # -------------------------------------------------------------------------
+    # Hard Task Auto-Splitting (after 2 failed rounds)
+    # -------------------------------------------------------------------------
+
+    def _try_split_hard_task(self, task: Task, base_sha: str) -> bool:
+        self.git_ops.hard_rollback(base_sha)
+        _, attempt_dir = self._next_attempt_dir(f"{task.id}_planner_split")
+        planner_profile = self.registry.for_role(AgentRole.PLANNER).profile
+
+        failure_history = "\n\n".join(
+            f"- [{c.author}/{c.kind}] {c.body}" for c in task.comments[-5:]
+        )
+        extra_inst = (
+            f"Hard task #{task.id} failed {task.review_rounds} full rounds.\n"
+            "Decompose it into 2 to 3 smaller atomic subtasks (easy or medium complexity) "
+            "and output valid JSON inside BEGIN_SUBTASKS_JSON / END_SUBTASKS_JSON.\n"
+            + (f"\nRecent failure history:\n{failure_history}" if failure_history else "")
+        )
+
+        built_prompt = self.prompt_builder.build(
+            role=AgentRole.PLANNER,
+            profile=planner_profile,
+            repo_map_text=self._refresh_repo_map(),
+            progress_text=self._read_progress_text(),
+            task=task,
+            extra_instructions=extra_inst,
+        )
+        response, guard_report = self._invoke_provider_guarded(
+            role=AgentRole.PLANNER,
+            built_prompt=built_prompt,
+            task_id=task.id,
+            attempt_dir=attempt_dir,
+            base_sha=base_sha,
+        )
+        if not guard_report.passed:
+            self.git_ops.hard_rollback(base_sha)
+            raise OrchestratorFatalError(
+                f"Read-only planner modified files while splitting #{task.id}: {guard_report.summary_text()}"
+            )
+        if response.exit_code != 0 or response.timed_out:
+            raise _PausedByInfraError(
+                reason=(
+                    f"planner provider '{response.provider_name}' failed "
+                    f"(exit_code={response.exit_code}, timed_out={response.timed_out})"
+                ),
+                task_id=task.id,
+                role=AgentRole.PLANNER,
+                provider=response.provider_name,
+            )
+
+        try:
+            planned = parse_planner_subtasks(response.parsed_text, task)
+        except (ValueError, json.JSONDecodeError) as exc:
+            self.store.add_comment(
+                task.id,
+                author="orchestrator",
+                kind="system",
+                body=f"Planner split output could not be parsed: {exc}",
+            )
+            return False
+
+        subtasks = [
+            Task(
+                id=spec.id,
+                title=spec.title,
+                description=spec.description,
+                complexity=spec.complexity,
+                depends_on=list(spec.depends_on),
+                allowed_paths=list(spec.allowed_paths or task.allowed_paths),
+                context_files=list(spec.context_files or task.context_files),
+                verify_cmd=spec.verify_cmd,
+                acceptance_criteria=list(spec.acceptance_criteria),
+                stage=task.stage,
+            )
+            for spec in planned.subtasks
+        ]
+        created = self.store.add_subtasks(task.id, subtasks)
+        self.event_bus.emit(
+            EventType.TASK_SPLIT,
+            task_id=task.id,
+            role=AgentRole.PLANNER,
+            provider=response.provider_name,
+            payload={"subtask_ids": [st.id for st in created], "rationale": planned.rationale},
+        )
+        return True
+
+    # -------------------------------------------------------------------------
+    # Scheduled Refactoring (every N accepted tasks / end of stage)
+    # -------------------------------------------------------------------------
+
+    def _run_refactorer(self, *, reason: str) -> None:
+        base_sha = self.git_ops.get_head_sha()
+        self.event_bus.update_state(
+            active_task_id=None,
+            active_task_base_sha=base_sha,
+            active_phase="refactorer",
+        )
+        _, attempt_dir = self._next_attempt_dir("refactorer")
+        self.event_bus.emit(
+            EventType.REFACTOR_STARTED,
+            role=AgentRole.REFACTORER,
+            provider=self.registry.profile_name_for_role(AgentRole.REFACTORER),
+            payload={
+                "reason": reason,
+                "accepted_since_last_refactor": self.event_bus.state.accepted_since_last_refactor,
+            },
+        )
+
+        ref_profile = self.registry.for_role(AgentRole.REFACTORER).profile
+        built_prompt = self.prompt_builder.build(
+            role=AgentRole.REFACTORER,
+            profile=ref_profile,
+            repo_map_text=self._refresh_repo_map(),
+            progress_text=self._read_progress_text(),
+            extra_instructions=(
+                f"Scheduled refactoring trigger: {reason}. "
+                "Focus strictly on modules referenced in PROGRESS.md. "
+                "Do not modify existing tests or Red Zone files."
+            ),
+        )
+        response, guard_report = self._invoke_provider_guarded(
+            role=AgentRole.REFACTORER,
+            built_prompt=built_prompt,
+            task_id=None,
+            attempt_dir=attempt_dir,
+            base_sha=base_sha,
+        )
+
+        if response.exit_code != 0 or response.timed_out or not guard_report.passed:
+            self.git_ops.hard_rollback(base_sha)
+            self.event_bus.emit(
+                EventType.REFACTOR_REVERTED,
+                role=AgentRole.REFACTORER,
+                provider=response.provider_name,
+                payload={"reason": guard_report.summary_text() or response.raw_stderr[:300]},
+            )
+            self.event_bus.update_state(accepted_since_last_refactor=0)
+            return
+
+        if not guard_report.changed_files:
+            self.event_bus.emit(
+                EventType.REFACTOR_FINISHED,
+                role=AgentRole.REFACTORER,
+                provider=response.provider_name,
+                payload={"changed_files": [], "no_changes": True},
+            )
+            self.event_bus.update_state(accepted_since_last_refactor=0)
+            return
+
+        gates_res = self.gate_runner.run_all(attempt_dir=attempt_dir, fail_fast=False)
+        atomic_write_text(attempt_dir / "gates.log", gates_res.combined_trimmed_log + "\n")
+        if not gates_res.passed:
+            self.git_ops.hard_rollback(base_sha)
+            self.event_bus.emit(
+                EventType.REFACTOR_REVERTED,
+                role=AgentRole.REFACTORER,
+                provider=response.provider_name,
+                payload={"reason": "gates_failed", "log_path": str(attempt_dir / "gates.log")},
+            )
+            self.event_bus.update_state(accepted_since_last_refactor=0)
+            return
+
+        commit_sha: str | None = None
+        if self.config.workflow.auto_commit:
+            commit_sha = self.git_ops.commit_all(f"refactor(pipeline): scheduled cleanup ({reason})")
+            self.event_bus.emit(
+                EventType.GIT_COMMITTED,
+                role=AgentRole.REFACTORER,
+                payload={"commit_sha": commit_sha, "kind": "refactor"},
+            )
+        parsed = parse_worker_output(response.parsed_text)
+        self._append_progress_entry(
+            f"Scheduled Refactoring ({reason})",
+            parsed.progress_update
+            or f"Refactored files: {', '.join(guard_report.changed_files)}.",
+        )
+        self.event_bus.emit(
+            EventType.REFACTOR_FINISHED,
+            role=AgentRole.REFACTORER,
+            provider=response.provider_name,
+            payload={"changed_files": guard_report.changed_files, "commit_sha": commit_sha},
+        )
+        self.event_bus.update_state(accepted_since_last_refactor=0)
+
+    # -------------------------------------------------------------------------
+    # Rollback & Failure Helper
+    # -------------------------------------------------------------------------
+
+    def _fail_task_and_rollback(self, task: Task, base_sha: str, *, reason: str) -> None:
+        self.git_ops.hard_rollback(base_sha)
+        self.event_bus.emit(
+            EventType.TASK_ROLLED_BACK,
+            task_id=task.id,
+            payload={"reason": reason, "base_sha": base_sha},
+        )
+        self.store.add_comment(
+            task.id,
+            author="orchestrator",
+            kind="system",
+            body=reason,
+        )
+        self._transition_task(
+            task.id,
+            TaskStatus.FAILED,
+            failure_reason=reason,
+            wip_commit_sha=None,
+            pending_progress_note=None,
+        )
+        blocked_ids = self.store.cascade_block_dependents(task.id)
+        for blocked_id in blocked_ids:
+            self.event_bus.emit(
+                EventType.TASK_STATUS_CHANGED,
+                task_id=blocked_id,
+                payload={"from": TaskStatus.TODO.value, "to": TaskStatus.BLOCKED.value, "blocked_by": task.id},
+            )
