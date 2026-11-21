@@ -9,7 +9,7 @@ import re
 import time
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, TextIO
 
 from orchestrator.config import PipelineConfig
 from orchestrator.control import ControlPlane, InboxManager
@@ -19,7 +19,7 @@ from orchestrator.diff_guard import (
     evaluate_diff,
     matches_any_glob,
 )
-from orchestrator.events import EventBus
+from orchestrator.events import EventBus, make_console_event_printer
 from orchestrator.fs_utils import (
     atomic_write_json,
     atomic_write_text,
@@ -71,6 +71,14 @@ _TRANSIENT_ERROR_RE = re.compile(
     r"broken\s+pipe|\beof\b|temporary\s+failure|network|connection\s+refused|"
     r"econnrefused|socket\s+hang\s+up|tls\s+handshake|remote\s+disconnected)",
     re.IGNORECASE,
+)
+
+# Legitimate operator input / runtime log channels inside `.pipeline/` that may change while a provider runs.
+PIPELINE_INTEGRITY_EXCLUDES: tuple[str, ...] = (
+    "control_inbox/**",
+    "INBOX.md",
+    "control.json",
+    "console.log",
 )
 
 
@@ -138,6 +146,8 @@ class OrchestratorRunner:
         gate_runner: GateRunner | None = None,
         notifier: BaseNotifier | None = None,
         sleep_fn: Any = None,
+        quiet: bool = False,
+        console_stream: TextIO | None = None,
     ) -> None:
         self.repo_root = repo_root.resolve()
         self.config = config
@@ -146,7 +156,17 @@ class OrchestratorRunner:
 
         self.store = store
         self.registry = registry
-        self.event_bus = event_bus or EventBus(self.pipeline_dir, config, defer_save=True)
+        self.quiet = quiet
+        console_callback = None if quiet else make_console_event_printer(console_stream)
+        if event_bus is not None:
+            self.event_bus = event_bus
+        else:
+            self.event_bus = EventBus(
+                self.pipeline_dir,
+                config,
+                defer_save=True,
+                on_event=console_callback,
+            )
         self.git_ops = git_ops or GitOps(self.repo_root, pipeline_dir=config.project.pipeline_dir)
         self.gate_runner = gate_runner or GateRunner(self.repo_root, config)
         self.prompt_builder = PromptBuilder(self.repo_root, config)
@@ -244,6 +264,13 @@ class OrchestratorRunner:
                 EventType.RUN_STARTED,
                 payload={"project": self.config.project.name, "max_tasks": max_tasks},
             )
+            todo_count, done_count, total_active = self._task_progress_counts()
+            max_suffix = f", max_tasks={max_tasks}" if max_tasks is not None else ""
+            self.notifier.notify(
+                "run_started",
+                f"Pipeline Started ({self.config.project.name})",
+                f"Run {self.event_bus.run_id}: {todo_count} todo, {done_count}/{total_active} done{max_suffix}.",
+            )
 
             tasks_processed = 0
             last_stage: str | None = None
@@ -335,9 +362,11 @@ class OrchestratorRunner:
             )
             self.event_bus.emit(EventType.RUN_FINISHED, payload={"tasks_processed": tasks_processed})
             self._generate_report()
-            self.notifier.send(
+            self.notifier.notify(
+                "run_finished",
                 f"Pipeline Completed ({self.config.project.name})",
-                f"Run {self.event_bus.run_id} finished. Report: {self.report_path}",
+                f"Run {self.event_bus.run_id} finished ({self._task_summary_line()}).\n"
+                f"Report: {self.report_path}",
             )
             return RunStatus.COMPLETED
 
@@ -357,13 +386,15 @@ class OrchestratorRunner:
                 payload={"reason": exc.reason},
             )
             self._generate_report()
-            self.notifier.send(
+            self.notifier.notify(
+                "pause",
                 f"Pipeline Paused on Provider Error ({self.config.project.name})",
                 f"Run {self.event_bus.run_id} paused without reverting approved/pending code: {exc.reason}",
             )
             return RunStatus.PAUSED
 
         except _AbortedByControlError:
+            self._cleanup_aborted_run()
             self.event_bus.update_state(
                 status=RunStatus.ABORTED,
                 active_task_id=None,
@@ -377,9 +408,11 @@ class OrchestratorRunner:
             )
             self.event_bus.emit(EventType.RUN_ABORTED, payload={"reason": "control_abort"})
             self._generate_report()
-            self.notifier.send(
+            self.notifier.notify(
+                "run_finished",
                 f"Pipeline Aborted ({self.config.project.name})",
-                f"Run {self.event_bus.run_id} was aborted via control plane.",
+                f"Run {self.event_bus.run_id} was aborted via control plane ({self._task_summary_line()}).\n"
+                f"Report: {self.report_path}",
             )
             return RunStatus.ABORTED
 
@@ -398,13 +431,97 @@ class OrchestratorRunner:
             )
             with contextlib.suppress(Exception):
                 self._generate_report()
-            self.notifier.send(
+            self.notifier.notify(
+                "fatal_error",
                 f"Orchestrator Fatal Error ({self.config.project.name})",
                 f"{type(exc).__name__}: {exc}",
             )
             raise
         finally:
             self._release_runner_lock()
+
+    def _task_progress_counts(self) -> tuple[int, int, int]:
+        """Return (todo_count, completed_count, active_total_count) excluding split parent placeholders."""
+        tasks = self.store.list_tasks()
+        active_tasks = [t for t in tasks if t.resolution != "split"]
+        todo_count = sum(1 for t in active_tasks if t.status == TaskStatus.TODO)
+        done_count = sum(1 for t in active_tasks if t.status == TaskStatus.DONE)
+        return todo_count, done_count, len(active_tasks)
+
+    def _task_summary_line(self) -> str:
+        tasks = [t for t in self.store.list_tasks() if t.resolution != "split"]
+        done = sum(1 for t in tasks if t.status == TaskStatus.DONE)
+        failed = sum(1 for t in tasks if t.status == TaskStatus.FAILED)
+        blocked = sum(1 for t in tasks if t.status == TaskStatus.BLOCKED)
+        remaining = len(tasks) - done - failed - blocked
+        return f"done={done}, failed={failed}, blocked={blocked}, remaining={remaining}"
+
+    def _cleanup_aborted_run(self) -> None:
+        """Roll back uncommitted work and return any unfinished active task to TODO on abort."""
+        active_task_id = self.event_bus.state.active_task_id
+        base_sha = self.event_bus.state.active_task_base_sha
+
+        active_task: Task | None = None
+        if active_task_id and "," not in active_task_id:
+            with contextlib.suppress(KeyError):
+                active_task = self.store.get_task(active_task_id)
+
+        unfinished_statuses = (
+            TaskStatus.IN_PROGRESS,
+            TaskStatus.GATES_FAILED,
+            TaskStatus.NEEDS_REVIEW,
+        )
+        unfinished_tasks: list[Task] = []
+        if active_task is not None and active_task.status in unfinished_statuses:
+            unfinished_tasks.append(active_task)
+        for task in self.store.list_tasks():
+            if task.status in unfinished_statuses and all(
+                t.id != task.id for t in unfinished_tasks
+            ):
+                unfinished_tasks.append(task)
+
+        needs_rollback = (
+            bool(unfinished_tasks)
+            or (active_task is not None and active_task.status == TaskStatus.ARCH_PENDING)
+            or (self.event_bus.state.active_phase == "refactorer")
+        )
+
+        rollback_sha: str | None = None
+        if needs_rollback:
+            if base_sha and self.git_ops.commit_exists(base_sha):
+                rollback_sha = base_sha
+            else:
+                rollback_sha = self.git_ops.get_head_sha()
+            if (
+                self.git_ops.has_uncommitted_changes()
+                or self.git_ops.get_head_sha() != rollback_sha
+            ):
+                self.git_ops.hard_rollback(rollback_sha)
+                self.event_bus.emit(
+                    EventType.TASK_ROLLED_BACK,
+                    task_id=active_task.id if active_task is not None else None,
+                    payload={"reason": "control_abort", "base_sha": rollback_sha},
+                )
+
+        for task in unfinished_tasks:
+            sha_note = f" (rolled back to {rollback_sha[:10]})" if rollback_sha else ""
+            self.store.add_comment(
+                task.id,
+                author="control_plane",
+                kind="control",
+                body=(
+                    f"Returned task from '{task.status.value}' to 'todo' "
+                    f"after control abort{sha_note}."
+                ),
+            )
+            self._transition_task(
+                task.id,
+                TaskStatus.TODO,
+                wip_commit_sha=None,
+                changed_files=[],
+                touched_yellow_zone=False,
+                pending_progress_note=None,
+            )
 
     def _recover_or_preflight(self, *, stale_lock_recovered: bool) -> None:
         if not self.git_ops.is_git_repo():
@@ -628,6 +745,11 @@ class OrchestratorRunner:
             pause_after_current=False,
         )
         self.event_bus.emit(EventType.PAUSE_ENTERED, payload={"reason": reason})
+        self.notifier.notify(
+            "pause",
+            f"Pipeline Paused ({self.config.project.name})",
+            f"Run {self.event_bus.run_id} paused ({reason}). Send `orchestrator control resume` to continue.",
+        )
         while self.event_bus.state.paused and not self._abort_requested:
             self._sleep(self.config.workflow.control_poll_seconds)
             self._process_control_commands()
@@ -659,6 +781,13 @@ class OrchestratorRunner:
             role=role,
             provider=provider_name,
             payload={"reason": "rate_limit", "cooldown_seconds": cooldown_seconds, "resume_at": resume_iso},
+        )
+        task_suffix = f" on #{task_id}" if task_id else ""
+        self.notifier.notify(
+            "pause",
+            f"Rate Limit Pause ({self.config.project.name})",
+            f"Provider '{provider_name}' rate-limited{task_suffix}. "
+            f"Cooldown: {cooldown_seconds}s (resume at {resume_iso}).",
         )
         while not self._abort_requested:
             self._process_control_commands()
@@ -788,8 +917,11 @@ class OrchestratorRunner:
             self.event_bus.quota_tracker.record_request(provider.name)
             self.event_bus.save_state()
 
-            # Integrity Guard snapshot of the entire .pipeline/ directory BEFORE agent runs
-            pipeline_snapshot_before = snapshot_directory_hashes(self.pipeline_dir)
+            # Integrity Guard snapshot of protected `.pipeline/` files BEFORE agent runs
+            pipeline_snapshot_before = snapshot_directory_hashes(
+                self.pipeline_dir,
+                exclude=PIPELINE_INTEGRITY_EXCLUDES,
+            )
 
             dynamic_body = "\n\n===\n\n".join(
                 part
@@ -812,8 +944,11 @@ class OrchestratorRunner:
             # FileNotFoundError is a permanent configuration error -> fail-fast without retry
             response = provider.invoke(request)
 
-            # Integrity Guard check AFTER agent runs (agents must NEVER touch .pipeline/)
-            pipeline_snapshot_after = snapshot_directory_hashes(self.pipeline_dir)
+            # Integrity Guard check AFTER agent runs (agents must NEVER touch protected `.pipeline/` files)
+            pipeline_snapshot_after = snapshot_directory_hashes(
+                self.pipeline_dir,
+                exclude=PIPELINE_INTEGRITY_EXCLUDES,
+            )
             tamper_changes = diff_directory_snapshots(
                 pipeline_snapshot_before,
                 pipeline_snapshot_after,
@@ -1127,7 +1262,6 @@ class OrchestratorRunner:
         while task.review_rounds < max_rounds:
             self._process_control_commands()
             if self._abort_requested:
-                self.git_ops.hard_rollback(task_base_sha)
                 raise _AbortedByControlError()
 
             gates_passed_this_round = False
@@ -1165,6 +1299,11 @@ class OrchestratorRunner:
                     task_complexity=task.complexity,
                     allowed_paths=task.allowed_paths,
                 )
+                # Honor `control abort` immediately after a provider call completes (before gates/retries/reviews)
+                self._process_control_commands()
+                if self._abort_requested:
+                    raise _AbortedByControlError()
+
                 last_guard_report = guard_report
                 parsed = parse_worker_output(response.parsed_text)
                 last_worker_parsed = parsed
@@ -1385,6 +1524,9 @@ class OrchestratorRunner:
                     base_sha=task_base_sha,
                     repo_map_text=repo_map_text,
                 )
+                self._process_control_commands()
+                if self._abort_requested:
+                    raise _AbortedByControlError()
                 if not pre_ok:
                     review_feedback = pre_feedback
                     self.store.add_comment(
@@ -1420,6 +1562,10 @@ class OrchestratorRunner:
                 base_sha=task_base_sha,
                 repo_map_text=repo_map_text,
             )
+            self._process_control_commands()
+            if self._abort_requested:
+                raise _AbortedByControlError()
+
             if master_ok:
                 final_sha: str | None = None
                 if last_guard_report.changed_files and self.config.workflow.auto_commit:
@@ -1446,6 +1592,13 @@ class OrchestratorRunner:
                 )
                 self.event_bus.update_state(
                     accepted_since_last_refactor=self.event_bus.state.accepted_since_last_refactor + 1
+                )
+                _, done_count, total_active = self._task_progress_counts()
+                sha_part = f" | Commit: {final_sha[:10]}" if final_sha else ""
+                self.notifier.notify(
+                    "task_done",
+                    f"Task Done #{task.id} ({self.config.project.name})",
+                    f"{task.title}\nProgress: {done_count}/{total_active}{sha_part}",
                 )
                 return
 
@@ -1625,6 +1778,9 @@ class OrchestratorRunner:
             )
 
         verdicts = parse_batch_review_verdicts(response.parsed_text, task_ids)
+        approved_tasks: list[Task] = []
+        requeued_ids: list[str] = []
+        batch_failed: list[tuple[Task, str, list[str]]] = []
 
         for task in batch_tasks:
             verdict = verdicts[task.id]
@@ -1654,6 +1810,7 @@ class OrchestratorRunner:
                 self.event_bus.update_state(
                     accepted_since_last_refactor=self.event_bus.state.accepted_since_last_refactor + 1
                 )
+                approved_tasks.append(task)
             else:
                 # Selectively revert ONLY the rejected task's commit without touching approved tasks
                 if task.wip_commit_sha:
@@ -1680,15 +1837,20 @@ class OrchestratorRunner:
                 )
                 new_rounds = task.review_rounds + 1
                 if new_rounds >= self.config.workflow.max_review_rounds:
+                    fail_reason = (
+                        f"Rejected in batch review after {new_rounds} rounds: "
+                        f"{verdict.feedback[:200]}"
+                    )
                     self._transition_task(
                         task.id,
                         TaskStatus.FAILED,
                         review_rounds=new_rounds,
                         wip_commit_sha=None,
                         pending_progress_note=None,
-                        failure_reason=f"Rejected in batch review after {new_rounds} rounds: {verdict.feedback[:200]}",
+                        failure_reason=fail_reason,
                     )
-                    self.store.cascade_block_dependents(task.id)
+                    blocked_ids = self.store.cascade_block_dependents(task.id)
+                    batch_failed.append((task, fail_reason, blocked_ids))
                 else:
                     self._transition_task(
                         task.id,
@@ -1697,8 +1859,36 @@ class OrchestratorRunner:
                         wip_commit_sha=None,
                         pending_progress_note=None,
                     )
+                    requeued_ids.append(task.id)
 
         self._sync_batch_queue_from_store()
+
+        if approved_tasks:
+            _, done_count, total_active = self._task_progress_counts()
+            approved_str = ", ".join(f"#{t.id} ({t.title})" for t in approved_tasks)
+            lines = [f"Approved ({len(approved_tasks)}): {approved_str}"]
+            if requeued_ids:
+                lines.append("Requeued: " + ", ".join(f"#{tid}" for tid in requeued_ids))
+            if batch_failed:
+                lines.append("Failed: " + ", ".join(f"#{t.id}" for t, _, _ in batch_failed))
+            lines.append(f"Progress: {done_count}/{total_active}")
+            self.notifier.notify(
+                "task_done",
+                f"Batch Review Done ({self.config.project.name})",
+                "\n".join(lines),
+            )
+
+        for failed_task, fail_reason, blocked_ids in batch_failed:
+            blocked_line = (
+                f"\nBlocked dependents: {', '.join(f'#{bid}' for bid in blocked_ids)}"
+                if blocked_ids
+                else ""
+            )
+            self.notifier.notify(
+                "task_failed",
+                f"Task Failed #{failed_task.id} ({self.config.project.name})",
+                f"{failed_task.title}\nReason: {fail_reason[:300]}{blocked_line}",
+            )
 
     # -------------------------------------------------------------------------
     # Architectural Escalation (STATUS: NEEDS_ARCH_CHANGE)
@@ -1749,6 +1939,11 @@ class OrchestratorRunner:
             role=AgentRole.ARCHITECT,
             provider=self.registry.profile_name_for_role(AgentRole.ARCHITECT),
             payload={"summary": worker_output.escalation_summary or details[:200]},
+        )
+        self.notifier.notify(
+            "escalation",
+            f"Escalation to Architect #{task.id} ({self.config.project.name})",
+            f"{task.title}\nSummary: {(worker_output.escalation_summary or details)[:300]}",
         )
         return self._invoke_architect_for_escalation(
             task=task,
@@ -1931,6 +2126,12 @@ class OrchestratorRunner:
             provider=response.provider_name,
             payload={"subtask_ids": [st.id for st in created], "rationale": planned.rationale},
         )
+        self.notifier.notify(
+            "escalation",
+            f"Hard Task Split #{task.id} ({self.config.project.name})",
+            f"{task.title}\nSubtasks: {', '.join(f'#{st.id}' for st in created)}\n"
+            f"Rationale: {planned.rationale[:240]}",
+        )
         return True
 
     # -------------------------------------------------------------------------
@@ -2062,3 +2263,13 @@ class OrchestratorRunner:
                 task_id=blocked_id,
                 payload={"from": TaskStatus.TODO.value, "to": TaskStatus.BLOCKED.value, "blocked_by": task.id},
             )
+        blocked_line = (
+            f"\nBlocked dependents: {', '.join(f'#{bid}' for bid in blocked_ids)}"
+            if blocked_ids
+            else ""
+        )
+        self.notifier.notify(
+            "task_failed",
+            f"Task Failed #{task.id} ({self.config.project.name})",
+            f"{task.title}\nReason: {reason[:300]}{blocked_line}",
+        )

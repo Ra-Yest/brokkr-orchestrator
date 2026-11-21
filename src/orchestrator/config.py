@@ -196,6 +196,13 @@ class ProviderProfileConfig(BaseModel):
         if self.kind == "cli":
             if not self.command:
                 raise ValueError("CLI provider profile requires non-empty 'command'")
+            if any("{model}" in tok for tok in self.args_template) and not (
+                self.model and self.model.strip()
+            ):
+                raise ValueError(
+                    "CLI provider profile uses '{model}' in args_template, "
+                    "but 'model' is missing or empty"
+                )
             if self.output_parser in ("json_field", "jsonl_last") and not self.output_json_path:
                 raise ValueError(
                     f"output_parser='{self.output_parser}' requires 'output_json_path'"
@@ -276,6 +283,7 @@ class ZonesConfig(BaseModel):
             "src/routes/**",
         ]
     )
+    enforce_allowed_paths_on_yellow: bool = False
 
 
 class DiffLimitConfig(BaseModel):
@@ -297,7 +305,10 @@ DEFAULT_DIFF_EXCLUDES: list[str] = [
     "**/*.ico",
     "**/*.woff*",
     "dist/**",
-    "build/**",
+    "app/build/**",
+    "android/build/**",
+    "web/build/**",
+    "**/build/outputs/**",
     "**/*.generated.*",
     "**/*.min.js",
     "**/*.min.css",
@@ -362,11 +373,35 @@ class WorkflowConfig(BaseModel):
         return self
 
 
+NotificationEvent = Literal[
+    "run_started",
+    "task_done",
+    "task_failed",
+    "escalation",
+    "pause",
+    "run_finished",
+    "fatal_error",
+]
+
+DEFAULT_TELEGRAM_EVENTS: list[NotificationEvent] = [
+    "run_started",
+    "task_done",
+    "task_failed",
+    "escalation",
+    "pause",
+    "run_finished",
+    "fatal_error",
+]
+
+
 class TelegramNotificationConfig(BaseModel):
     enabled: bool = False
     bot_token_env: str = "TELEGRAM_BOT_TOKEN"
     chat_id_env: str = "TELEGRAM_CHAT_ID"
     timeout_seconds: int = Field(default=10, ge=1)
+    events: list[NotificationEvent] = Field(
+        default_factory=lambda: list(DEFAULT_TELEGRAM_EVENTS)
+    )
 
 
 class NotificationsConfig(BaseModel):
@@ -392,7 +427,10 @@ class ProjectConfig(BaseModel):
             ".mypy_cache",
             ".ruff_cache",
             "dist",
-            "build",
+            "app/build",
+            "android/build",
+            "web/build",
+            "**/build/outputs",
             ".next",
         ]
     )

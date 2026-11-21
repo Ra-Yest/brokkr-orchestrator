@@ -204,6 +204,13 @@ class CliAgentProvider(BaseAgentProvider):
     def healthcheck(self) -> tuple[bool, str]:
         if not self.profile.command:
             return False, "No command configured"
+        if any("{model}" in tok for tok in self.profile.args_template) and not (
+            self.profile.model and self.profile.model.strip()
+        ):
+            return (
+                False,
+                "args_template references '{model}', but profile 'model' is missing or empty",
+            )
         exe = self.profile.command[0]
         resolved = shutil.which(exe, path=os.environ.get("PATH"))
         if resolved is None:

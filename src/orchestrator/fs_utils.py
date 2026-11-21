@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import contextlib
+import fnmatch
 import hashlib
 import json
 import os
 import time
 import uuid
+from collections.abc import Collection
 from pathlib import Path
 from typing import Any
 
@@ -117,16 +119,73 @@ def append_jsonl(path: Path, record: dict[str, Any]) -> None:
         handle.flush()
 
 
-def snapshot_directory_hashes(root: Path) -> dict[str, str]:
-    """Capture SHA-256 hashes of every file under root using POSIX relative paths."""
+def _normalize_snapshot_pattern(pattern: str) -> str:
+    norm = pattern.replace("\\", "/")
+    while norm.startswith("./"):
+        norm = norm[2:]
+    return norm.lstrip("/")
+
+
+def _is_snapshot_excluded(rel_posix: str, patterns: tuple[str, ...]) -> bool:
+    for pat in patterns:
+        if not pat:
+            continue
+        if pat.endswith("/**"):
+            prefix = pat[:-3].rstrip("/")
+            if rel_posix == prefix or rel_posix.startswith(prefix + "/"):
+                return True
+            continue
+        if pat.endswith("/"):
+            prefix = pat.rstrip("/")
+            if rel_posix == prefix or rel_posix.startswith(prefix + "/"):
+                return True
+            continue
+        if "*" in pat or "?" in pat or "[" in pat:
+            if fnmatch.fnmatchcase(rel_posix, pat):
+                return True
+            continue
+        if rel_posix == pat or rel_posix.startswith(pat + "/"):
+            return True
+    return False
+
+
+def snapshot_directory_hashes(
+    root: Path,
+    *,
+    exclude: Collection[str] | None = None,
+) -> dict[str, str]:
+    """Capture SHA-256 hashes of every non-excluded file under root using POSIX relative paths."""
     if not root.exists():
         return {}
+    norm_patterns = tuple(_normalize_snapshot_pattern(p) for p in (exclude or ()))
     hashes: dict[str, str] = {}
-    for item in sorted(root.rglob("*")):
-        if item.is_file():
-            rel = item.relative_to(root).as_posix()
-            hashes[rel] = sha256_file(item)
-    return hashes
+    root_resolved = root.resolve()
+
+    for dirpath, dirnames, filenames in os.walk(root_resolved):
+        current = Path(dirpath)
+        rel_dir = "" if current == root_resolved else current.relative_to(root_resolved).as_posix()
+
+        # Prune excluded directories before walking into them (prevents races with control_inbox/)
+        dirnames.sort()
+        if norm_patterns:
+            dirnames[:] = [
+                d
+                for d in dirnames
+                if not _is_snapshot_excluded(
+                    f"{rel_dir}/{d}" if rel_dir else d,
+                    norm_patterns,
+                )
+            ]
+
+        for filename in sorted(filenames):
+            rel_file = f"{rel_dir}/{filename}" if rel_dir else filename
+            if norm_patterns and _is_snapshot_excluded(rel_file, norm_patterns):
+                continue
+            item = current / filename
+            if item.is_file():
+                hashes[rel_file] = sha256_file(item)
+
+    return {k: hashes[k] for k in sorted(hashes)}
 
 
 def diff_directory_snapshots(

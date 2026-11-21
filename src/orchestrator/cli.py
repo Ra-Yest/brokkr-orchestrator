@@ -3,13 +3,16 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
+import os
 import shutil
 import sys
 from collections import Counter
 from pathlib import Path
 
-from orchestrator.config import PipelineConfig, load_pipeline_config
+from orchestrator import __version__
+from orchestrator.config import PipelineConfig, load_pipeline_config, resolve_env_map
 from orchestrator.control import INBOX_TEMPLATE, enqueue_control_command
 from orchestrator.events import EventBus
 from orchestrator.fs_utils import atomic_write_json, atomic_write_text
@@ -64,79 +67,157 @@ def _default_config_path(repo_root: Path, explicit: str | None) -> Path:
     return in_pipeline
 
 
-def _stack_preset_yaml(project_name: str, stack: str) -> str:
-    example_path = find_example_config()
-    if stack == "generic" and example_path is not None:
-        raw = example_path.read_text(encoding="utf-8")
-        return raw.replace('name: "example-app"', f'name: "{project_name}"')
+def _providers_and_roles_yaml(provider_preset: str) -> str:
+    if provider_preset == "agy-only":
+        return """providers:
+  agy_worker_easy:
+    kind: "cli"
+    can_edit_files: true
+    command: ["agy"]
+    prompt_mode: "stdin"
+    args_template:
+      - "--model"
+      - "{model}"
+      - "--mode"
+      - "auto"
+      - "--dangerously-skip-permissions"
+      - "--disable-slash-commands"
+      - "--input-format"
+      - "text"
+      - "--output-format"
+      - "text"
+    model: "gemini-4-hydrogen-medium"
+    timeout_seconds: 900
+    anti_laziness: false
+    rate_limit_cooldown_seconds: 900
+    quota_window_seconds: 18000
 
-    if stack == "python":
-        gates_block = """gates:
-  - name: "lint"
-    command: ["ruff", "check", "."]
-    timeout_seconds: 120
-  - name: "typecheck"
-    command: ["mypy", "src"]
-    timeout_seconds: 180
-  - name: "tests"
-    command: ["pytest", "-q"]
-    timeout_seconds: 300"""
-        yellow_block = """  yellow_shared:
-    - "pyproject.toml"
-    - "alembic/**"
-    - "src/shared/**"
-    - "src/db/**"
-    - "src/api/router.py" """
-    elif stack == "typescript":
-        gates_block = """gates:
-  - name: "lint"
-    command: ["npm", "run", "lint"]
-    timeout_seconds: 180
-  - name: "typecheck"
-    command: ["npm", "run", "typecheck"]
-    timeout_seconds: 180
-  - name: "build"
-    command: ["npm", "run", "build"]
-    timeout_seconds: 300
-  - name: "tests"
-    command: ["npm", "test", "--", "--run"]
-    timeout_seconds: 300"""
-        yellow_block = """  yellow_shared:
-    - "package.json"
-    - "tsconfig.json"
-    - "next.config.*"
-    - "src/shared/**"
-    - "src/types/**"
-    - "prisma/schema.prisma" """
-    else:
-        gates_block = """gates:
-  - name: "tests"
-    command: ["pytest", "-q"]
-    timeout_seconds: 300"""
-        yellow_block = """  yellow_shared:
-    - "pyproject.toml"
-    - "package.json"
-    - "src/shared/**" """
+  agy_worker_medium:
+    kind: "cli"
+    can_edit_files: true
+    command: ["agy"]
+    prompt_mode: "stdin"
+    args_template:
+      - "--model"
+      - "{model}"
+      - "--mode"
+      - "auto"
+      - "--dangerously-skip-permissions"
+      - "--disable-slash-commands"
+      - "--input-format"
+      - "text"
+      - "--output-format"
+      - "text"
+    model: "gemini-4-hydrogen-high"
+    timeout_seconds: 900
+    anti_laziness: false
+    rate_limit_cooldown_seconds: 900
+    quota_window_seconds: 18000
 
-    return f"""schema_version: 1
-project:
-  name: "{project_name}"
-  pipeline_dir: ".pipeline"
-  agents_file: "AGENTS.md"
-  agent_roles_dir: ".agents"
-  anti_laziness_file: ".agents/anti_laziness_openai.md"
-  tasks_file: "tasks.json"
+  agy_worker_hard:
+    kind: "cli"
+    can_edit_files: true
+    command: ["agy"]
+    prompt_mode: "stdin"
+    args_template:
+      - "--model"
+      - "{model}"
+      - "--mode"
+      - "auto"
+      - "--dangerously-skip-permissions"
+      - "--disable-slash-commands"
+      - "--input-format"
+      - "text"
+      - "--output-format"
+      - "text"
+    model: "gemini-4-neon-high"
+    timeout_seconds: 900
+    anti_laziness: false
+    rate_limit_cooldown_seconds: 900
+    quota_window_seconds: 18000
 
-providers:
+  agy_pre_reviewer:
+    kind: "cli"
+    can_edit_files: false
+    command: ["agy"]
+    prompt_mode: "stdin"
+    args_template:
+      - "--model"
+      - "{model}"
+      - "--mode"
+      - "plan"
+      - "--input-format"
+      - "text"
+      - "--output-format"
+      - "text"
+    model: "gemini-4-neon-medium"
+    timeout_seconds: 600
+    anti_laziness: false
+    rate_limit_cooldown_seconds: 900
+    quota_window_seconds: 18000
+
+  agy_master_readonly:
+    kind: "cli"
+    can_edit_files: false
+    command: ["agy"]
+    prompt_mode: "stdin"
+    args_template:
+      - "--model"
+      - "{model}"
+      - "--mode"
+      - "plan"
+      - "--input-format"
+      - "text"
+      - "--output-format"
+      - "text"
+    model: "gemini-4-neon-xhigh"
+    timeout_seconds: 900
+    anti_laziness: false
+    rate_limit_cooldown_seconds: 900
+    quota_window_seconds: 18000
+
+  agy_master_write:
+    kind: "cli"
+    can_edit_files: true
+    command: ["agy"]
+    prompt_mode: "stdin"
+    args_template:
+      - "--model"
+      - "{model}"
+      - "--mode"
+      - "auto"
+      - "--dangerously-skip-permissions"
+      - "--disable-slash-commands"
+      - "--input-format"
+      - "text"
+      - "--output-format"
+      - "text"
+    model: "gemini-4-neon-xhigh"
+    timeout_seconds: 900
+    anti_laziness: false
+    rate_limit_cooldown_seconds: 900
+    quota_window_seconds: 18000
+
+roles:
+  planner: "agy_master_readonly"
+  worker_easy: "agy_worker_easy"
+  worker_medium: "agy_worker_medium"
+  worker_hard: "agy_worker_hard"
+  pre_reviewer: "agy_pre_reviewer"
+  reviewer: "agy_master_readonly"
+  architect: "agy_master_write"
+  refactorer: "agy_master_write" """.rstrip()
+
+    return """providers:
   provider_fast:
     kind: "cli"
     can_edit_files: true
     command: ["codex", "exec"]
     prompt_mode: "stdin"
-    args_template: ["--full-auto", "--model", "{{model}}", "-"]
+    args_template: ["--full-auto", "--model", "{model}", "-"]
     model: "gpt-5-codex-mini"
     env:
-      OPENAI_API_KEY: "${{OPENAI_API_KEY:-}}"
+      OPENAI_API_KEY: "${OPENAI_API_KEY:-}"
     timeout_seconds: 900
     anti_laziness: true
     rate_limit_cooldown_seconds: 900
@@ -145,10 +226,41 @@ providers:
   provider_main:
     kind: "cli"
     can_edit_files: true
-    command: ["agy", "run"]
-    prompt_mode: "tempfile"
-    args_template: ["--non-interactive", "--prompt-file", "{{prompt_file}}"]
+    command: ["agy"]
+    prompt_mode: "stdin"
+    args_template:
+      - "--model"
+      - "{model}"
+      - "--mode"
+      - "auto"
+      - "--dangerously-skip-permissions"
+      - "--disable-slash-commands"
+      - "--input-format"
+      - "text"
+      - "--output-format"
+      - "text"
+    model: "gemini-4-hydrogen-high"
     timeout_seconds: 900
+    anti_laziness: false
+    rate_limit_cooldown_seconds: 900
+    quota_window_seconds: 18000
+
+  provider_pre_reviewer_agy:
+    kind: "cli"
+    can_edit_files: false
+    command: ["agy"]
+    prompt_mode: "stdin"
+    args_template:
+      - "--model"
+      - "{model}"
+      - "--mode"
+      - "plan"
+      - "--input-format"
+      - "text"
+      - "--output-format"
+      - "text"
+    model: "gemini-4-neon-medium"
+    timeout_seconds: 600
     anti_laziness: false
     rate_limit_cooldown_seconds: 900
     quota_window_seconds: 18000
@@ -178,10 +290,101 @@ roles:
   worker_easy: "provider_fast"
   worker_medium: "provider_main"
   worker_hard: "provider_master"
-  pre_reviewer: "provider_main"
+  pre_reviewer: "provider_pre_reviewer_agy"
   reviewer: "provider_master"
   architect: "provider_master"
-  refactorer: "provider_master"
+  refactorer: "provider_master" """.rstrip()
+
+
+def _stack_preset_yaml(
+    project_name: str,
+    stack: str,
+    provider_preset: str = "default",
+) -> str:
+    example_path = find_example_config()
+    if stack == "generic" and provider_preset == "default" and example_path is not None:
+        raw = example_path.read_text(encoding="utf-8")
+        return raw.replace('name: "example-app"', f'name: "{project_name}"')
+
+    if stack == "python":
+        repo_map_extra = '    - "build"\n'
+        gates_block = """gates:
+  - name: "lint"
+    command: ["ruff", "check", "."]
+    timeout_seconds: 120
+  - name: "typecheck"
+    command: ["mypy", "src"]
+    timeout_seconds: 180
+  - name: "tests"
+    command: ["pytest", "-q"]
+    timeout_seconds: 300"""
+        yellow_block = """  yellow_shared:
+    - "pyproject.toml"
+    - "alembic/**"
+    - "src/shared/**"
+    - "src/db/**"
+    - "src/api/router.py" """.rstrip()
+    elif stack == "typescript":
+        repo_map_extra = '    - "build"\n'
+        gates_block = """gates:
+  - name: "lint"
+    command: ["npm", "run", "lint"]
+    timeout_seconds: 180
+  - name: "typecheck"
+    command: ["npm", "run", "typecheck"]
+    timeout_seconds: 180
+  - name: "build"
+    command: ["npm", "run", "build"]
+    timeout_seconds: 300
+  - name: "tests"
+    command: ["npm", "test", "--", "--run"]
+    timeout_seconds: 300"""
+        yellow_block = """  yellow_shared:
+    - "package.json"
+    - "tsconfig.json"
+    - "next.config.*"
+    - "src/shared/**"
+    - "src/types/**"
+    - "prisma/schema.prisma" """.rstrip()
+    else:
+        repo_map_extra = ""
+        gates_block = """gates:
+  - name: "tests"
+    command: ["pytest", "-q"]
+    timeout_seconds: 300"""
+        yellow_block = """  yellow_shared:
+    - "pyproject.toml"
+    - "package.json"
+    - "src/shared/**" """.rstrip()
+
+    providers_roles = _providers_and_roles_yaml(provider_preset)
+
+    return f"""schema_version: 1
+project:
+  name: "{project_name}"
+  pipeline_dir: ".pipeline"
+  agents_file: "AGENTS.md"
+  agent_roles_dir: ".agents"
+  anti_laziness_file: ".agents/anti_laziness_openai.md"
+  tasks_file: "tasks.json"
+  repo_map_ignore:
+    - ".git"
+    - ".pipeline"
+    - ".venv"
+    - "venv"
+    - "node_modules"
+    - "__pycache__"
+    - ".pytest_cache"
+    - ".mypy_cache"
+    - ".ruff_cache"
+    - "dist"
+    - "app/build"
+    - "android/build"
+    - "web/build"
+    - "**/build/outputs"
+{repo_map_extra}    - ".next"
+
+{providers_roles}
 
 zones:
   red_protected:
@@ -200,6 +403,7 @@ zones:
     - "**/*.test.*"
     - "**/*.spec.*"
 {yellow_block}
+  enforce_allowed_paths_on_yellow: false
 
 diff_guard:
   limits:
@@ -226,6 +430,14 @@ notifications:
     enabled: false
     bot_token_env: "TELEGRAM_BOT_TOKEN"
     chat_id_env: "TELEGRAM_CHAT_ID"
+    events:
+      - "run_started"
+      - "task_done"
+      - "task_failed"
+      - "escalation"
+      - "pause"
+      - "run_finished"
+      - "fatal_error"
 """
 
 
@@ -282,7 +494,14 @@ def cmd_init(args: argparse.Namespace) -> int:
 
     cfg_path = pipeline_dir / "pipeline.yaml"
     if not cfg_path.exists() or args.force:
-        atomic_write_text(cfg_path, _stack_preset_yaml(repo_root.name, args.stack))
+        atomic_write_text(
+            cfg_path,
+            _stack_preset_yaml(
+                repo_root.name,
+                args.stack,
+                provider_preset=args.provider_preset,
+            ),
+        )
         copied.append(".pipeline/pipeline.yaml")
     else:
         skipped.append(".pipeline/pipeline.yaml")
@@ -425,6 +644,60 @@ def run_doctor_checks(repo_root: Path, config_path: Path) -> list[tuple[str, boo
             ok, msg = provider.healthcheck()
             checks.append((f"provider:{profile_name}", ok, msg))
 
+        # Quality gates preflight checks (executable availability, cwd, required env)
+        for gate in config.gates:
+            gate_cwd = repo_root / gate.cwd if gate.cwd else repo_root
+            resolved_env, missing_env = resolve_env_map(gate.env, strict=False)
+            lookup_path = resolved_env.get("PATH", os.environ.get("PATH"))
+            exe = gate.command[0]
+            resolved_exe = shutil.which(exe, path=lookup_path)
+            if resolved_exe is None and ("/" in exe or "\\" in exe):
+                local_candidate = Path(exe) if Path(exe).is_absolute() else (gate_cwd / exe)
+                if local_candidate.is_file():
+                    resolved_exe = str(local_candidate)
+
+            problems: list[str] = []
+            if not gate_cwd.is_dir():
+                problems.append(f"Working directory not found: {gate_cwd}")
+            if resolved_exe is None:
+                problems.append(f"Executable '{exe}' not found in PATH")
+            if missing_env:
+                problems.append(f"Missing required env var(s): {', '.join(missing_env)}")
+
+            if problems:
+                detail = "; ".join(problems)
+                if gate.optional:
+                    checks.append((f"gate:{gate.name}", True, f"WARN (optional): {detail}"))
+                else:
+                    checks.append((f"gate:{gate.name}", False, detail))
+            else:
+                checks.append((f"gate:{gate.name}", True, f"Executable resolved: {resolved_exe}"))
+
+        # Telegram notifications env preflight (non-blocking warning when env is injected at runtime)
+        tg = config.notifications.telegram
+        if tg.enabled:
+            missing_tg = [
+                env_name
+                for env_name in (tg.bot_token_env, tg.chat_id_env)
+                if not os.environ.get(env_name, "").strip()
+            ]
+            if missing_tg:
+                checks.append(
+                    (
+                        "notifications:telegram",
+                        True,
+                        f"WARN: Telegram enabled, but missing env var(s): {', '.join(missing_tg)}",
+                    )
+                )
+            else:
+                checks.append(
+                    (
+                        "notifications:telegram",
+                        True,
+                        f"Telegram enabled ({len(tg.events)} event(s); env vars set)",
+                    )
+                )
+
     return checks
 
 
@@ -463,9 +736,10 @@ def cmd_run(args: argparse.Namespace) -> int:
         config=config,
         store=store,
         registry=registry,
+        quiet=bool(args.quiet),
     )
     status = runner.run(max_tasks=args.max_tasks)
-    print(f"Run finished with status: {status.value} (report: {runner.report_path})")
+    print(f"Run finished with status: {status.value} (report: {runner.report_path})", flush=True)
     return 0 if status in (RunStatus.COMPLETED, RunStatus.ABORTED) else 1
 
 
@@ -558,6 +832,11 @@ def build_parser() -> argparse.ArgumentParser:
         prog="orchestrator",
         description="Modular, fault-tolerant local AFK AI development pipeline orchestrator",
     )
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=f"%(prog)s {__version__}",
+    )
     sub = parser.add_subparsers(dest="command", required=True)
 
     p_init = sub.add_parser("init", help="Copy templates into a target repository and run doctor")
@@ -567,6 +846,12 @@ def build_parser() -> argparse.ArgumentParser:
         choices=["generic", "python", "typescript"],
         default="generic",
         help="Starter pipeline.yaml preset",
+    )
+    p_init.add_argument(
+        "--provider-preset",
+        choices=["default", "agy-only"],
+        default="default",
+        help="Starter provider profile preset (default mixed providers or agy-only Gemini 4)",
     )
     p_init.add_argument("--force", action="store_true", help="Overwrite existing templates/config")
     p_init.set_defaults(func=cmd_init)
@@ -581,6 +866,12 @@ def build_parser() -> argparse.ArgumentParser:
     p_run.add_argument("--config", default=None, help="Path to pipeline.yaml")
     p_run.add_argument("--max-tasks", type=int, default=None, help="Stop after N tasks")
     p_run.add_argument("--dry-run", action="store_true", help="Validate config/tasks and exit")
+    p_run.add_argument(
+        "-q",
+        "--quiet",
+        action="store_true",
+        help="Suppress live progress lines in stdout during run",
+    )
     p_run.set_defaults(func=cmd_run)
 
     p_status = sub.add_parser("status", help="Inspect current state.json, tasks, and quotas")
@@ -607,7 +898,17 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _configure_stdio_buffering() -> None:
+    """Enable line buffering on stdout/stderr so piped output (e.g., PowerShell Tee-Object) flushes immediately."""
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if callable(reconfigure):
+            with contextlib.suppress(Exception):
+                reconfigure(line_buffering=True, write_through=True)
+
+
 def main(argv: list[str] | None = None) -> int:
+    _configure_stdio_buffering()
     parser = build_parser()
     args = parser.parse_args(argv)
     return int(args.func(args))

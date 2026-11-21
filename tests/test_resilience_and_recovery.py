@@ -372,6 +372,9 @@ def test_abort_command_interrupts_transient_backoff_immediately(temp_git_repo: P
     # Interrupted after just 1 tick — did NOT wait all 90 seconds or invoke reviewer a second time
     assert len(sleep_ticks) == 1
     assert reviewer_calls["count"] == 1
+    # Unfinished task is rolled back cleanly and returned to TODO
+    assert store.get_task("A-1").status == TaskStatus.TODO
+    assert not (temp_git_repo / "src/features/alpha/a1.py").exists()
 
 
 def test_runner_lock_blocks_live_pid_and_recovers_stale_pid(temp_git_repo: Path) -> None:

@@ -6,8 +6,8 @@ The AFK Orchestrator is a headless, event-driven Python 3.11+ pipeline runner de
 
 1. **Provider Independence (`BaseAgentProvider` + `ProviderRegistry`):** Models and CLI tools are never hardcoded. Profiles (`provider_fast`, `provider_main`, `provider_strong`, `provider_master`, `provider_reviewer_api`) are mapped to the 8 pipeline roles purely via `pipeline.yaml`. Each provider declares `can_edit_files: bool` (`false` by default for `kind: "api"`), and config validation rejects non-editing providers on writing roles (`worker_*`, `architect`, `refactorer`).
 2. **Task Store Independence (`BaseTaskStore`):** Task selection, dependency DAG validation, subtask decomposition, and comment persistence go strictly through `BaseTaskStore`. `LocalJsonTaskStore` is shipped now; swapping to `GitHubIssuesTaskStore` in Team Mode requires zero changes in `runner.py`.
-3. **Headless Event-Driven Core:** All runtime telemetry streams to append-only `.pipeline/events.jsonl`, current state is atomically snapshotted to `.pipeline/state.json`, attempt artifacts live under `.pipeline/runs/<run_id>/<task_id>/attempt_<n>/`, and control commands arrive race-free via `.pipeline/control_inbox/<cmd>.json`.
-4. **Strict Runner Isolation (No Self-Repair):** The orchestrator code lives outside the target repository. Agents are strictly forbidden from touching `.pipeline/` (enforced by an Integrity Guard SHA-256 snapshot before/after every call) and from committing directly to Git (enforced by `base_sha` soft-reset). On any internal orchestrator error, the runner emits `orchestrator_fatal_error`, sends an optional Telegram alert, generates `REPORT.md`, and exits non-zero without attempting self-repair.
+3. **Headless Event-Driven Core:** All runtime telemetry streams to append-only `.pipeline/events.jsonl` (with optional compact `[HH:MM:SS]` live stdout progress enabled by default and toggleable via `run --quiet`, using line-buffered stdio), current state is atomically snapshotted to `.pipeline/state.json`, attempt artifacts live under `.pipeline/runs/<run_id>/<task_id>/attempt_<n>/`, and control commands arrive race-free via `.pipeline/control_inbox/<cmd>.json`.
+4. **Strict Runner Isolation (No Self-Repair):** The orchestrator code lives outside the target repository. Agents are strictly forbidden from touching protected `.pipeline/` state (`pipeline.yaml`, `tasks.json`, `state.json`, `events.jsonl`, `runs/**`, `PROGRESS.md`, etc. — enforced by an Integrity Guard SHA-256 snapshot before/after every call, while excluding legitimate operator/runtime channels `control_inbox/**`, `INBOX.md`, `control.json`, and `console.log`) and from committing directly to Git (enforced by `base_sha` soft-reset). On any internal orchestrator error, the runner emits `orchestrator_fatal_error`, sends a fail-safe Telegram alert (if enabled), generates `REPORT.md`, and exits non-zero without attempting self-repair.
 
 ### 1.1 Module Diagram
 
@@ -50,9 +50,11 @@ stateDiagram-v2
     in_progress --> batch_pending : easy + green zone + wip commit
     in_progress --> needs_review : medium/hard OR yellow zone touched
     in_progress --> done : hard task split by planner (resolution=split)
+    in_progress --> todo : control abort (rollback to base_sha)
     in_progress --> failed : max rounds exhausted -> rollback
 
     gates_failed --> in_progress : retry within round budget
+    gates_failed --> todo : control abort (rollback to base_sha)
     gates_failed --> failed : max rounds exhausted -> rollback
 
     arch_pending --> in_progress : architect resolved + PROGRESS updated
@@ -61,6 +63,7 @@ stateDiagram-v2
     needs_review --> done : Master APPROVE + final commit + PROGRESS updated
     needs_review --> in_progress : pre_reviewer or Master REJECT (rounds < max)
     needs_review --> done : hard task split after 2 failed rounds (resolution=split)
+    needs_review --> todo : control abort (rollback to base_sha)
     needs_review --> failed : max rounds exhausted -> rollback
 
     batch_pending --> done : batch VERDICT #id APPROVE + PROGRESS updated
@@ -76,15 +79,16 @@ stateDiagram-v2
 - **Batch Independence & Selective Rollback:** Every `easy` task entering `batch_pending` must have zero mutual `depends_on` (direct or transitive), disjoint `changed_files`, and `touched_yellow_zone == false`. It is recorded as an isolated `wip(task-<id>)` commit. `PROGRESS.md` is **not** updated until Master outputs `VERDICT #<id>: APPROVE`. Any `REJECT` executes `git revert --no-edit <wip_commit_sha>`, rolling back only that task without impacting approved siblings.
 - **Hard Task Auto-Split:** After `workflow.hard_split_after_rounds` (default `2`) failed rounds on a `hard` task, the runner rolls back uncommitted edits and invokes read-only `planner` to emit 2–3 atomic subtasks. Downstream tasks depending on the parent are atomically rewired to the leaf subtasks, and the parent transitions to `done` with `resolution: "split"` and `subtask_ids: [...]` (excluded from the refactor counter).
 - **Pre-Provider Safety Sequence:**
-  1. Snapshot `base_sha = git rev-parse HEAD` and SHA-256 of `.pipeline/` (Integrity Guard).
-  2. Run provider non-interactively (`stdin=DEVNULL` for non-stdin modes, `shutil.which` executable resolution, Windows Job Object / POSIX process group kill on timeout).
-  3. Verify `.pipeline/` snapshot is byte-for-byte unchanged (agents never write to `.pipeline/`).
+  1. Snapshot `base_sha = git rev-parse HEAD` and SHA-256 of protected `.pipeline/` files (Integrity Guard, excluding `control_inbox/**`, `INBOX.md`, `control.json`, `console.log`).
+  2. Run provider non-interactively (`stdin=DEVNULL` for non-stdin modes, `PYTHONDONTWRITEBYTECODE=1` + `PYTHONUTF8=1`, `shutil.which` executable resolution, Windows Job Object / POSIX process group kill on timeout).
+  3. Verify protected `.pipeline/` snapshot is byte-for-byte unchanged (agents never write to protected `.pipeline/` files).
   4. If `HEAD != base_sha`, run `git reset --soft <base_sha>` and emit `agent_commit_soft_reset`.
   5. Run `git add -N` on all untracked files outside `.pipeline/` and `.gitignore` so new files enter `git diff --name-status <base_sha>`, Diff Guard, Placeholder Guard, Red Zone test checks, and `diff.patch`.
   6. Run role-aware `evaluate_diff`:
      - `planner`, `pre_reviewer`, `reviewer`: strictly read-only (any repo change is a fatal Red Zone violation with rollback).
      - `architect`, `refactorer`: allowed outside a single task's `allowed_paths` (including `yellow_shared`), while Red Zone and the `M`/`D`/`R` existing-test ban remain enforced.
-     - `worker_*`: full Red/Yellow/Green enforcement, `M`/`D`/`R` test ban (`A` permitted inside `allowed_paths`), complexity diff limits, and Placeholder Guard.
+     - `worker_*`: full Red/Yellow/Green enforcement (optional `zones.enforce_allowed_paths_on_yellow`), `M`/`D`/`R` test ban (`A` permitted inside `allowed_paths`), complexity diff limits (both `max_files` and `max_lines` exclude `diff_guard.exclude_from_review` artifacts), and Placeholder Guard.
+- **Clean Abort Rollback:** `control abort` is checked immediately after provider calls as well as during backoff/pause loops; any unfinished active task (`in_progress`, `gates_failed`, `needs_review`) is rolled back to `base_sha` and returned to `todo`, while `batch_pending` commits and `arch_pending` escalations are preserved.
 
 ---
 
@@ -120,7 +124,7 @@ providers:
     max_tokens: int?
     temperature: float?
     # Common fields:
-    model: string?
+    model: string?                 # Required if kind == "api" OR args_template contains {model}
     env:                           # Supports ${VAR} (required), ${VAR:-default} (optional; omitted if ${VAR:-} unset),
       <KEY>: string | { from_env: string, optional: bool, default: string? }
     timeout_seconds: int           # Default: 900
@@ -145,6 +149,7 @@ zones:
   red_protected: [glob]
   test_patterns: [glob]
   yellow_shared: [glob]
+  enforce_allowed_paths_on_yellow: bool  # Default: false (true enforces task.allowed_paths on yellow_shared for workers)
 
 diff_guard:
   limits:
@@ -189,6 +194,7 @@ notifications:
     bot_token_env: string
     chat_id_env: string
     timeout_seconds: int
+    events: [string]               # Default: [run_started, task_done, task_failed, escalation, pause, run_finished, fatal_error]
 ```
 
 ### 3.2 `tasks.json` Schema
@@ -253,7 +259,7 @@ Each line is a self-contained UTF-8 JSON object:
 ```
 
 Canonical `event_type` values:
-`run_started`, `run_finished`, `run_aborted`, `orchestrator_fatal_error`, `task_claimed`, `task_status_changed`, `provider_invoked`, `provider_succeeded`, `provider_failed`, `provider_rate_limited`, `agent_commit_soft_reset`, `gate_started`, `gate_passed`, `gate_failed`, `placeholder_guard_failed`, `red_zone_violation`, `yellow_zone_triggered`, `diff_guard_failed`, `pre_review_completed`, `review_completed`, `batch_review_started`, `batch_verdict_received`, `escalation_triggered`, `architect_resolved`, `task_split`, `refactor_started`, `refactor_finished`, `refactor_reverted`, `git_committed`, `git_reverted`, `task_rolled_back`, `control_command_applied`, `inbox_consumed`, `pause_entered`, `pause_resumed`, `report_generated`.
+`run_started`, `run_finished`, `run_aborted`, `orchestrator_fatal_error`, `task_claimed`, `task_status_changed`, `provider_invoked`, `provider_succeeded`, `provider_failed`, `provider_rate_limited`, `provider_transient_retry`, `agent_commit_soft_reset`, `stale_lock_recovered`, `crash_recovery_completed`, `gate_started`, `gate_passed`, `gate_failed`, `placeholder_guard_failed`, `red_zone_violation`, `yellow_zone_triggered`, `diff_guard_failed`, `pre_review_completed`, `review_completed`, `batch_review_started`, `batch_review_deferred`, `batch_verdict_received`, `escalation_triggered`, `architect_resolved`, `task_split`, `refactor_started`, `refactor_finished`, `refactor_reverted`, `git_committed`, `git_reverted`, `task_rolled_back`, `control_command_applied`, `inbox_consumed`, `pause_entered`, `pause_resumed`, `report_generated`.
 
 ### 3.4 `state.json` Schema (Atomically Replaced Snapshot)
 

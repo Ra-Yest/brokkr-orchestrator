@@ -201,7 +201,13 @@ DEFAULT_PLACEHOLDER_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
     ("COMMENT_EXISTING_CODE", re.compile(r"(?://|#|/\*)\s*\.\.\.\s*(?:existing|rest of|remaining|unchanged|more)\b", re.IGNORECASE)),
     ("JS_NOT_IMPLEMENTED", re.compile(r"throw\s+new\s+Error\(\s*['\"][^'\"]*not\s+implemented", re.IGNORECASE)),
     ("RUST_TODO_MACRO", re.compile(r"\b(?:todo|unimplemented)!\s*\(")),
-    ("EMPTY_STUB_COMMENT", re.compile(r"(?://|#)\s*(?:stub|placeholder implementation|implement me)\b", re.IGNORECASE)),
+    (
+        "EMPTY_STUB_COMMENT",
+        re.compile(
+            r"(?://|#)\s*(?:(?:empty\s+)?stub\b\s*$|stub\s+(?:implementation|only|method|function)\b|placeholder\s+implementation\b|implement\s+me\b)",
+            re.IGNORECASE,
+        ),
+    ),
 ]
 
 _PY_DEF_RE = re.compile(r"^(\s*)(?:async\s+)?def\s+[A-Za-z_][A-Za-z0-9_]*\s*\(")
@@ -425,6 +431,23 @@ def evaluate_diff(
         is_yellow = any(matches_any_glob(p, zones.yellow_shared) for p in paths_to_check)
         if is_yellow:
             yellow_files.append(_normalize_rel_path(change.path))
+            if (
+                zones.enforce_allowed_paths_on_yellow
+                and not is_architect_role
+                and task_allowed
+                and not matches_any_glob(change.path, task_allowed)
+            ):
+                scope_violations.append(
+                    GuardViolation(
+                        code="OUT_OF_ALLOWED_PATHS",
+                        path=change.path,
+                        line=None,
+                        message=(
+                            f"Yellow Zone file '{change.path}' is outside task allowed_paths: "
+                            f"{task_allowed}"
+                        ),
+                    )
+                )
             continue
 
         # 2d. Green zone: workers must stay within allowed_paths (if specified); architect/refactorer may span modules
@@ -442,17 +465,21 @@ def evaluate_diff(
                 )
             )
 
-    # 3. Diff Guard file & line limits
+    # 3. Diff Guard file & line limits (excluding exclude_from_review artifacts/generated files)
     limit = _resolve_diff_limit(role, config, task_complexity)
+    countable_files = [
+        f for f in changed_files if not matches_any_glob(f, config.diff_guard.exclude_from_review)
+    ]
     total_changed_lines = added_lines + deleted_lines
-    if len(changed_files) > limit.max_files:
+    if len(countable_files) > limit.max_files:
         limit_violations.append(
             GuardViolation(
                 code="DIFF_GUARD_MAX_FILES",
                 path=None,
                 line=None,
                 message=(
-                    f"Changed {len(changed_files)} files, exceeding Diff Guard limit "
+                    f"Changed {len(countable_files)} countable files "
+                    f"({len(changed_files)} total), exceeding Diff Guard limit "
                     f"of {limit.max_files} files for {role.value}"
                 ),
             )

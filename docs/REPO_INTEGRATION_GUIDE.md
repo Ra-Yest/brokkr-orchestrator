@@ -23,14 +23,20 @@ This guide walks you through connecting any **new or existing** Git repository t
 
 ## Step 1: Initialize Target Repository (`orchestrator init`)
 
-Run `orchestrator init` pointing at your target Git repository. Pick a starter preset (`python`, `typescript`, or `generic`):
+Run `orchestrator init` pointing at your target Git repository. Pick a starter stack preset (`python`, `typescript`, or `generic`) and an optional `--provider-preset` (`default` mixed providers or `agy-only` for Antigravity CLI with Gemini 4 profiles out of the box):
 
 ```bash
+# Check installed orchestrator version
+orchestrator --version
+
 # Python / FastAPI repository
 orchestrator init --repo /path/to/my-backend --stack python
 
 # TypeScript / Next.js repository
 orchestrator init --repo /path/to/my-frontend --stack typescript
+
+# Generic / polyglot repository using Antigravity CLI (`agy`) only (Gemini 4 preset)
+orchestrator init --repo /path/to/my-repo --stack generic --provider-preset agy-only
 ```
 
 What `orchestrator init` does automatically:
@@ -81,9 +87,12 @@ Edit `<target-repo>/AGENTS.md`. Remember that `AGENTS.md` is placed in **Layer 1
 
 - Every profile declares `can_edit_files: bool` (defaults to `true` for `kind: "cli"`, `false` for `kind: "api"`).
 - Writing roles (`worker_easy`, `worker_medium`, `worker_hard`, `architect`, `refactorer`) **must** use a provider with `can_edit_files: true`.
-- Read-only roles (`planner`, `pre_reviewer`, `reviewer`) may use either a CLI provider or an OpenAI-compatible `kind: "api"` provider.
+- Read-only roles (`planner`, `pre_reviewer`, `reviewer`) may use either a CLI provider (e.g., `agy` with `can_edit_files: false` and `--mode plan`, without `--disable-slash-commands`) or an OpenAI-compatible `kind: "api"` provider.
+- If a CLI profile's `args_template` uses `{model}`, the `model` field is required and validated on load / `doctor`.
 - Optional env vars use `${VAR:-}` syntax: if `OPENAI_API_KEY` is unset (e.g. `codex exec` authenticated via ChatGPT Plus OAuth), the orchestrator omits the key cleanly instead of failing.
 - Set `anti_laziness: true` on OpenAI / shortcut-prone profiles to automatically append `.agents/anti_laziness_openai.md` to their static prefix.
+- Set `zones.enforce_allowed_paths_on_yellow: true` if you want workers to fail with `OUT_OF_ALLOWED_PATHS` (prompting `STATUS: NEEDS_ARCH_CHANGE` -> `architect`) when touching `yellow_shared` files not explicitly listed in `task.allowed_paths` (defaults to `false` for solo Master review).
+- Configure Telegram AFK notifications under `notifications.telegram` (by default sends 7 concise event categories without retry spam: `run_started`, `task_done` with consolidated batch summaries, `task_failed`, `escalation`, `pause`, `run_finished`, `fatal_error`; customize via `notifications.telegram.events`).
 
 ### Example A: Python / FastAPI (`zones` & `gates`)
 
@@ -226,21 +235,30 @@ Write atomic, well-scoped tasks forming an acyclic DAG (`depends_on`):
 ## Step 6: Run Preflight Check & Launch
 
 ```bash
-# 1. Verify git state, .gitignore, schemas, templates, and active provider binaries
+# 1. Verify git state, .gitignore, schemas, templates, active providers, gate binaries, and Telegram env
 orchestrator doctor --repo /path/to/my-repo
 
 # 2. Dry-run validation
 orchestrator run --repo /path/to/my-repo --dry-run
 
-# 3. Start AFK execution
+# 3. Start AFK execution (streams compact [HH:MM:SS] live progress lines to stdout by default)
 orchestrator run --repo /path/to/my-repo
+
+# 4. Suppress live console progress lines (keep events.jsonl / state.json only)
+orchestrator run --repo /path/to/my-repo --quiet
+```
+
+On Windows PowerShell, `orchestrator` enables line-buffered stdout/stderr automatically, so piping directly to a log file works in real time without `PYTHONUNBUFFERED=1` (and `.pipeline/console.log` is excluded from Integrity Guard):
+
+```powershell
+orchestrator run --repo D:\my-repo | Tee-Object D:\my-repo\.pipeline\console.log
 ```
 
 ---
 
 ## Step 7: Live Monitoring & Mid-Run Control
 
-While the pipeline runs in AFK mode:
+While the pipeline runs in AFK mode (commands in `.pipeline/control_inbox/`, `.pipeline/INBOX.md`, `.pipeline/control.json`, and `.pipeline/console.log` are allowed during provider runs and never trigger Integrity Guard):
 
 ```bash
 # Check live status, active task/provider, batch queue, and 5-hour rolling quotas
@@ -258,7 +276,7 @@ orchestrator control retry --repo /path/to/my-repo --task-id T-002
 # Skip a task and block dependents
 orchestrator control skip --repo /path/to/my-repo --task-id T-005 --reason "Deferred"
 
-# Abort cleanly
+# Abort cleanly (rolls back uncommitted work and returns any unfinished active task to `todo`)
 orchestrator control abort --repo /path/to/my-repo
 ```
 

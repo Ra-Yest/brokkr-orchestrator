@@ -187,6 +187,7 @@ def run_noninteractive_process(
     merged_env.setdefault("GIT_TERMINAL_PROMPT", "0")
     merged_env.setdefault("PYTHONUTF8", "1")
     merged_env.setdefault("PYTHONIOENCODING", "utf-8")
+    merged_env.setdefault("PYTHONDONTWRITEBYTECODE", "1")
 
     resolved_cmd = resolve_executable(command, env=merged_env)
     stdin_arg = subprocess.PIPE if stdin_data is not None else subprocess.DEVNULL

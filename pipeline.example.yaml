@@ -22,7 +22,10 @@ project:
     - ".mypy_cache"
     - ".ruff_cache"
     - "dist"
-    - "build"
+    - "app/build"
+    - "android/build"
+    - "web/build"
+    - "**/build/outputs"
     - ".next"
 
 providers:
@@ -49,15 +52,49 @@ providers:
     quota_window_seconds: 18000
     quota_max_requests: 120
 
-  # Main worker via Antigravity CLI (tempfile prompt delivery, non-interactive)
+  # Main worker via Antigravity CLI (stdin prompt delivery, non-interactive write mode)
   provider_main:
     kind: "cli"
     can_edit_files: true
-    command: ["agy", "run"]
-    prompt_mode: "tempfile"
-    args_template: ["--non-interactive", "--prompt-file", "{prompt_file}"]
+    command: ["agy"]
+    prompt_mode: "stdin"
+    args_template:
+      - "--model"
+      - "{model}"
+      - "--mode"
+      - "auto"
+      - "--dangerously-skip-permissions"
+      - "--disable-slash-commands"
+      - "--input-format"
+      - "text"
+      - "--output-format"
+      - "text"
+    model: "gemini-4-hydrogen-high"
     output_parser: "plain"
     timeout_seconds: 900
+    anti_laziness: false
+    rate_limit_cooldown_seconds: 900
+    quota_window_seconds: 18000
+    quota_max_requests: 80
+
+  # Read-only pre-reviewer via Antigravity CLI (`--mode plan`, without `--disable-slash-commands`)
+  provider_pre_reviewer_agy:
+    kind: "cli"
+    can_edit_files: false
+    command: ["agy"]
+    prompt_mode: "stdin"
+    args_template:
+      - "--model"
+      - "{model}"
+      - "--mode"
+      - "plan"
+      - "--input-format"
+      - "text"
+      - "--output-format"
+      - "text"
+    model: "gemini-4-neon-medium"
+    output_parser: "plain"
+    timeout_seconds: 600
     anti_laziness: false
     rate_limit_cooldown_seconds: 900
     quota_window_seconds: 18000
@@ -113,14 +150,14 @@ providers:
 
 # Role-to-profile mapping (change Master or Worker without touching orchestrator code)
 roles:
-  planner: "provider_master"          # Can also use `provider_reviewer_api`
+  planner: "provider_master"            # Can also use `provider_reviewer_api`
   worker_easy: "provider_fast"
   worker_medium: "provider_main"
   worker_hard: "provider_strong"
-  pre_reviewer: "provider_main"       # Can also use `provider_reviewer_api`
-  reviewer: "provider_master"         # Can also use `provider_reviewer_api`
-  architect: "provider_master"        # Must have can_edit_files: true
-  refactorer: "provider_master"       # Must have can_edit_files: true
+  pre_reviewer: "provider_pre_reviewer_agy"  # Can also use `provider_reviewer_api`
+  reviewer: "provider_master"           # Can also use `provider_reviewer_api`
+  architect: "provider_master"          # Must have can_edit_files: true
+  refactorer: "provider_master"         # Must have can_edit_files: true
 
 zones:
   red_protected:
@@ -146,6 +183,7 @@ zones:
     - "src/db/**"
     - "src/router*"
     - "src/routes/**"
+  enforce_allowed_paths_on_yellow: false
 
 diff_guard:
   limits:
@@ -164,7 +202,10 @@ diff_guard:
     - "**/*.png"
     - "**/*.jpg"
     - "dist/**"
-    - "build/**"
+    - "app/build/**"
+    - "android/build/**"
+    - "web/build/**"
+    - "**/build/outputs/**"
     - "**/*.generated.*"
 
 placeholder_guard:
@@ -215,3 +256,11 @@ notifications:
     bot_token_env: "TELEGRAM_BOT_TOKEN"
     chat_id_env: "TELEGRAM_CHAT_ID"
     timeout_seconds: 10
+    events:
+      - "run_started"
+      - "task_done"
+      - "task_failed"
+      - "escalation"
+      - "pause"
+      - "run_finished"
+      - "fatal_error"
