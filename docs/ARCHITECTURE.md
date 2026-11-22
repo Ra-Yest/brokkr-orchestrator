@@ -19,15 +19,16 @@ flowchart TD
     RUNNER --> REG["providers/base.py -> ProviderRegistry"]
     REG --> CLIPROV["providers/cli_provider.py (CliAgentProvider)"]
     REG --> APIPROV["providers/api_provider.py (ApiAgentProvider)"]
-    CLIPROV --> PROC["process_utils.py (Job Objects / killpg / which)"]
+    CLIPROV --> PROC["process_utils.py (Streaming stdout/stderr, Idle Timeout, Job Objects)"]
     RUNNER --> PB["prompt_builder.py (3-Layer Cache + REPO_MAP)"]
     RUNNER --> GIT["git_ops.py (base_sha, add -N, revert, rollback)"]
-    RUNNER --> GUARD["diff_guard.py (Role-aware Zones, Diff & Placeholder Guard)"]
+    RUNNER --> GUARD["diff_guard.py (Role-aware Zones, Soft/Hard Diff & Placeholder Guard)"]
     RUNNER --> GATES["gates.py (Free Gates, Playwright, Log Trimmer)"]
     RUNNER --> PARSER["output_parser.py (STATUS / VERDICT / JSON Subtasks)"]
     RUNNER --> EVENTS["events.py (events.jsonl, state.json, QuotaTracker)"]
     RUNNER --> CTRL["control.py (control_inbox -> control_processed, INBOX.md)"]
     RUNNER --> NOTIFY["notifications.py (TelegramNotifier)"]
+    RUNNER --> PROXY["proxy_monitor.py (BaseProxyMonitor -> GenericProxyMonitor)"]
     RUNNER --> REPORT["reporter.py (REPORT.md + Manual Checklist)"]
 ```
 
@@ -87,8 +88,14 @@ stateDiagram-v2
   6. Run role-aware `evaluate_diff`:
      - `planner`, `pre_reviewer`, `reviewer`: strictly read-only (any repo change is a fatal Red Zone violation with rollback).
      - `architect`, `refactorer`: allowed outside a single task's `allowed_paths` (including `yellow_shared`), while Red Zone and the `M`/`D`/`R` existing-test ban remain enforced.
-     - `worker_*`: full Red/Yellow/Green enforcement (optional `zones.enforce_allowed_paths_on_yellow`), `M`/`D`/`R` test ban (`A` permitted inside `allowed_paths`), complexity diff limits (both `max_files` and `max_lines` exclude `diff_guard.exclude_from_review` artifacts), and Placeholder Guard.
-- **Clean Abort Rollback:** `control abort` is checked immediately after provider calls as well as during backoff/pause loops; any unfinished active task (`in_progress`, `gates_failed`, `needs_review`) is rolled back to `base_sha` and returned to `todo`, while `batch_pending` commits and `arch_pending` escalations are preserved.
+     - `worker_*`: full Red/Yellow/Green enforcement (optional `zones.enforce_allowed_paths_on_yellow`), `M`/`D`/`R` test ban (`A` permitted inside `allowed_paths`), soft/hard complexity diff limits (optionally excluding `zones.test_patterns` from production limits while enforcing a separate `hard_max_test_lines` ceiling; soft limit exceedance disables `batch_pending`, emits `diff_guard_soft_warning`, and injects `DIFF_GUARD_SOFT_WARNING` into reviewer prompts without rollback), and Placeholder Guard.
+- **Step-Level Pause & Clean Abort Rollback:** `control abort` and `pause_after_current` are honored immediately after each provider step (before launching retries, gates, or reviews) as well as during backoff/hibernation loops; any unfinished active task (`in_progress`, `gates_failed`, `needs_review`) is rolled back to `active_task_base_sha` and returned to `todo` on `abort`, while `batch_pending` commits and `arch_pending` escalations are preserved.
+- **Overnight Resilience (v0.2):**
+  - **Streaming `stdout`/`stderr` & Idle Timeout:** `run_noninteractive_process()` streams `stdout`/`stderr` in dedicated UTF-8 reader threads, emits `provider_response_started` and updates `state.active_phase = "streaming:<role>"` on the first non-ANSI meaningful chunk, notifies Telegram on recovery after retries (`provider_recovered_after_retry`), and kills hung processes via optional `idle_timeout_seconds` only when both stream I/O and workspace file mtimes are idle.
+  - **Free Transport Retries:** Fast pre-response failures (`duration < transport_failure_max_duration_seconds`, clean git tree, no meaningful stdout or connection/proxy error, non-permanent) retry with jittered delays (`provider_transport_retry`) without incrementing `task.attempts`, `review_rounds`, or `QuotaTracker`. Long or dirty writing-role failures bypass blind `provider_transient_retry` and return upward immediately.
+  - **Fallback Providers & Hibernation:** On `429` or `quota_max_requests`, compatible `fallback_providers` are tried immediately (`provider_fallback_used`). When all candidates for a role are in cooldown, the runner enters `status = "hibernating"` with `resume_at`, emits `runner_hibernating`, sends a single Telegram alert, polls `control_inbox/` in short ticks (instant `abort`/`resume`), and emits `runner_woke_up` upon waking.
+  - **Declarative Proxy Monitor (`proxy_monitor.py`):** Optional `GenericProxyMonitor` configured via `proxy_monitor:` (or an external gitignored `config_file`, e.g. `proxy_monitor.local.yaml`, with `${ENV_VAR}` expansion) supports TCP port probes, JSON status field probes (`route_field`, `last_ok_at_field`, `disabled_field`, `blockers_field`, `transient_error_field`), and regex log tail probes (`ok_patterns`, `transient_patterns`, `fatal_patterns`). It stores sanitized `proxy_health_status` in `state.json`, routes transient route-switching into free `transport_retry`, and immediately pauses with `pause_reason = "proxy_error"` on fatal blockers/service-down without burning retries.
+  - **Sequential Account Switching:** Providers configuring `account_group`, `account_profile`, and `switch_command` switch accounts automatically before invocation when `state.active_accounts[group] != profile`, emitting `provider_account_switched` or failing fast on error (`provider_account_switch_failed`).
 
 ---
 
@@ -128,11 +135,16 @@ providers:
     env:                           # Supports ${VAR} (required), ${VAR:-default} (optional; omitted if ${VAR:-} unset),
       <KEY>: string | { from_env: string, optional: bool, default: string? }
     timeout_seconds: int           # Default: 900
+    idle_timeout_seconds: int?     # Optional stream + workspace mtime idle kill timeout
     anti_laziness: bool            # Default: false; appends anti_laziness_openai.md to Layer 1 static prefix
     rate_limit_patterns: [regex]
     rate_limit_cooldown_seconds: int  # Default: 900
     quota_window_seconds: int      # Default: 18000 (5 hours)
     quota_max_requests: int?       # Optional rolling window cap
+    fallback_providers: [string]   # Optional fallback profiles tried on 429 / quota ceiling
+    account_group: string?         # Optional account switch group (e.g., "agy")
+    account_profile: string?       # Optional target profile within account_group (e.g., "pro")
+    switch_command: [string]       # Required when account_group/account_profile set (30s timeout)
 
 roles:
   planner: <profile_name>
@@ -145,6 +157,9 @@ roles:
   refactorer: <profile_name>       # Must have can_edit_files: true
   role_prompt_files: { <role>: string }  # Optional overrides
 
+fallback_providers:                # Optional role-level fallback profiles
+  <role>: [<profile_name>, ...]
+
 zones:
   red_protected: [glob]
   test_patterns: [glob]
@@ -152,12 +167,15 @@ zones:
   enforce_allowed_paths_on_yellow: bool  # Default: false (true enforces task.allowed_paths on yellow_shared for workers)
 
 diff_guard:
+  exclude_tests_from_limits: bool  # Default: true (test_patterns excluded from prod limits)
+  hard_max_test_lines: int         # Default: 3000 (separate ceiling for new test lines)
   limits:
-    easy:   { max_files: int, max_lines: int }
-    medium: { max_files: int, max_lines: int }
-    hard:   { max_files: int, max_lines: int }
-  architect_limit:  { max_files: int, max_lines: int }
-  refactorer_limit: { max_files: int, max_lines: int }
+    # Legacy { max_files, max_lines } remains accepted and maps to hard_max_*
+    easy:   { soft_max_files: int?, soft_max_lines: int?, hard_max_files: int, hard_max_lines: int }
+    medium: { soft_max_files: int?, soft_max_lines: int?, hard_max_files: int, hard_max_lines: int }
+    hard:   { soft_max_files: int?, soft_max_lines: int?, hard_max_files: int, hard_max_lines: int }
+  architect_limit:  { soft_max_files: int?, soft_max_lines: int?, hard_max_files: int, hard_max_lines: int }
+  refactorer_limit: { soft_max_files: int?, soft_max_lines: int?, hard_max_files: int, hard_max_lines: int }
   exclude_from_review: [glob]
 
 placeholder_guard:
@@ -182,6 +200,11 @@ workflow:
   refactor_every_n_tasks: int      # Default: 6 (0 disables periodic count trigger)
   refactor_on_stage_complete: bool # Default: true
   cleanup_ports: [int]
+  max_transport_retries: int       # Default: 6 (free retries before response)
+  transport_retry_delays_seconds: [int]  # Default: [3, 5, 10, 20, 30]
+  transport_failure_max_duration_seconds: int  # Default: 120
+  transient_retry_delays_seconds: [int]
+  retry_on_timeout_readonly: int
   rate_limit_poll_seconds: float
   control_poll_seconds: float
   auto_commit: bool
@@ -194,7 +217,30 @@ notifications:
     bot_token_env: string
     chat_id_env: string
     timeout_seconds: int
+    notify_on_provider_started: bool  # Default: false
     events: [string]               # Default: [run_started, task_done, task_failed, escalation, pause, run_finished, fatal_error]
+
+proxy_monitor:
+  enabled: bool                    # Default: false
+  config_file: string?             # Optional external YAML path (relative to pipeline.yaml or absolute; supports ${ENV_VAR})
+  apply_to_providers: [string]     # Explicit provider profile names monitored by this proxy
+  proxy_host: string?              # Optional TCP probe host (e.g., "127.0.0.1")
+  proxy_port: int?                 # Optional TCP probe port (e.g., 8080)
+  tcp_timeout_seconds: float       # Default: 2.0
+  status_json:                     # Optional declarative JSON status file probe
+    path: string                   # Supports ${ENV_VAR}
+    route_field: string?           # Dot-notation field path (e.g., "route" or "last_ok.route")
+    last_ok_at_field: string?
+    disabled_field: string?        # Boolean field: true => unhealthy / requires manual action
+    blockers_field: string?        # List/string field: non-empty => requires manual action
+    transient_error_field: string? # Dict/string/bool field => route_switching
+    error_field: string?
+  log_probes:                      # Optional declarative log tail regex probes
+    - path: string                 # Supports ${ENV_VAR}
+      tail_lines: int              # Default: 80
+      ok_patterns: [regex]
+      transient_patterns: [regex]
+      fatal_patterns: [regex]
 ```
 
 ### 3.2 `tasks.json` Schema
@@ -259,7 +305,7 @@ Each line is a self-contained UTF-8 JSON object:
 ```
 
 Canonical `event_type` values:
-`run_started`, `run_finished`, `run_aborted`, `orchestrator_fatal_error`, `task_claimed`, `task_status_changed`, `provider_invoked`, `provider_succeeded`, `provider_failed`, `provider_rate_limited`, `provider_transient_retry`, `agent_commit_soft_reset`, `stale_lock_recovered`, `crash_recovery_completed`, `gate_started`, `gate_passed`, `gate_failed`, `placeholder_guard_failed`, `red_zone_violation`, `yellow_zone_triggered`, `diff_guard_failed`, `pre_review_completed`, `review_completed`, `batch_review_started`, `batch_review_deferred`, `batch_verdict_received`, `escalation_triggered`, `architect_resolved`, `task_split`, `refactor_started`, `refactor_finished`, `refactor_reverted`, `git_committed`, `git_reverted`, `task_rolled_back`, `control_command_applied`, `inbox_consumed`, `pause_entered`, `pause_resumed`, `report_generated`.
+`run_started`, `run_finished`, `run_aborted`, `orchestrator_fatal_error`, `task_claimed`, `task_status_changed`, `provider_invoked`, `provider_response_started`, `provider_recovered_after_retry`, `provider_succeeded`, `provider_failed`, `provider_rate_limited`, `provider_transport_retry`, `provider_transient_retry`, `provider_fallback_used`, `provider_account_switched`, `provider_account_switch_failed`, `agent_commit_soft_reset`, `stale_lock_recovered`, `crash_recovery_completed`, `gate_started`, `gate_passed`, `gate_failed`, `placeholder_guard_failed`, `red_zone_violation`, `yellow_zone_triggered`, `diff_guard_soft_warning`, `diff_guard_failed`, `pre_review_completed`, `review_completed`, `batch_review_started`, `batch_review_deferred`, `batch_verdict_received`, `escalation_triggered`, `architect_resolved`, `task_split`, `refactor_started`, `refactor_finished`, `refactor_reverted`, `git_committed`, `git_reverted`, `task_rolled_back`, `control_command_applied`, `inbox_consumed`, `pause_entered`, `pause_resumed`, `runner_hibernating`, `runner_woke_up`, `proxy_status_changed`, `proxy_error`, `report_generated`.
 
 ### 3.4 `state.json` Schema (Atomically Replaced Snapshot)
 
@@ -291,6 +337,23 @@ Written via temp-file + `fsync` + `os.replace()` with a 5-attempt Windows `Permi
       "cooldown_until": null,
       "last_rate_limited_at": null
     }
+  },
+  "active_accounts": {
+    "agy": "pro"
+  },
+  "proxy_health_status": {
+    "healthy": true,
+    "state": "ok",
+    "proxy_reachable": true,
+    "active_route": "primary-gateway",
+    "last_message": "11:47:34 proxy upstream ok via primary-gateway",
+    "last_ok_at": "2026-11-22T08:47:34Z",
+    "route_switching": false,
+    "requires_manual_action": false,
+    "fatal_reason": null,
+    "blockers": [],
+    "raw_excerpt": "...",
+    "checked_at": "2026-11-22T08:47:40Z"
   },
   "updated_at": "2026-11-20T20:01:15Z"
 }

@@ -110,6 +110,11 @@ class QuotaTracker:
         )
         return resume_dt
 
+    def clear_cooldown(self, provider_name: str) -> None:
+        q = self.quotas.get(provider_name)
+        if q is not None and q.cooldown_until is not None:
+            self.quotas[provider_name] = q.model_copy(update={"cooldown_until": None})
+
     def seconds_until_available(self, provider_name: str, now: datetime | None = None) -> int:
         current = now or datetime.now(UTC)
         self.prune_all(current)
@@ -160,6 +165,17 @@ def format_console_event(event: PipelineEvent) -> str | None:
             f"provider={prov_val} ({p.get('prompt_chars', 0)} chars)"
         )
 
+    if et == EventType.PROVIDER_RESPONSE_STARTED:
+        return (
+            f"[{ts}] provider_response_started {task_tag}role={role_val} provider={prov_val}"
+        )
+
+    if et == EventType.PROVIDER_RECOVERED_AFTER_RETRY:
+        return (
+            f"[{ts}] provider_recovered_after_retry {task_tag}role={role_val} "
+            f"provider={prov_val} retries={p.get('transport_retries', 0)}"
+        )
+
     if et == EventType.PROVIDER_SUCCEEDED:
         changed = p.get("changed_files")
         file_count = len(changed) if isinstance(changed, list) else 0
@@ -180,10 +196,34 @@ def format_console_event(event: PipelineEvent) -> str | None:
             f"cooldown={p.get('cooldown_seconds')}s"
         )
 
+    if et == EventType.PROVIDER_TRANSPORT_RETRY:
+        return (
+            f"[{ts}] provider_transport_retry {task_tag}provider={prov_val} "
+            f"attempt={p.get('attempt')}/{p.get('max_attempts')} delay={p.get('delay_seconds')}s"
+        )
+
     if et == EventType.PROVIDER_TRANSIENT_RETRY:
         return (
             f"[{ts}] provider_transient_retry {task_tag}provider={prov_val} "
             f"attempt={p.get('attempt')}/{p.get('max_attempts')} delay={p.get('delay_seconds')}s"
+        )
+
+    if et == EventType.PROVIDER_FALLBACK_USED:
+        return (
+            f"[{ts}] provider_fallback_used {task_tag}role={role_val} "
+            f"{p.get('from_provider')} -> {p.get('to_provider')} ({p.get('reason')})"
+        )
+
+    if et == EventType.PROVIDER_ACCOUNT_SWITCHED:
+        return (
+            f"[{ts}] provider_account_switched group={p.get('account_group')} "
+            f"{p.get('from_profile')} -> {p.get('to_profile')}"
+        )
+
+    if et == EventType.PROVIDER_ACCOUNT_SWITCH_FAILED:
+        return (
+            f"[{ts}] provider_account_switch_failed group={p.get('account_group')} "
+            f"target={p.get('to_profile')} exit={p.get('exit_code')}"
         )
 
     if et == EventType.GATE_PASSED:
@@ -195,6 +235,12 @@ def format_console_event(event: PipelineEvent) -> str | None:
         failed = p.get("failed_gates")
         names = ",".join(str(g) for g in failed) if isinstance(failed, list) else ""
         return f"[{ts}] gate_failed {task_tag}failed={names or 'unknown'}"
+
+    if et == EventType.DIFF_GUARD_SOFT_WARNING:
+        details = p.get("details")
+        first = str(details[0])[:120] if isinstance(details, list) and details else ""
+        suffix = f" ({first})" if first else ""
+        return f"[{ts}] diff_guard_soft_warning {task_tag}{suffix}".rstrip()
 
     if et == EventType.DIFF_GUARD_FAILED:
         details = p.get("details")
@@ -291,6 +337,25 @@ def format_console_event(event: PipelineEvent) -> str | None:
         reason = p.get("reason") or "operator_resume"
         return f"[{ts}] pause_resumed {task_tag}reason={reason}"
 
+    if et == EventType.RUNNER_HIBERNATING:
+        return (
+            f"[{ts}] runner_hibernating {task_tag}resume_at={p.get('resume_at')} "
+            f"cooldown={p.get('cooldown_seconds')}s"
+        )
+
+    if et == EventType.RUNNER_WOKE_UP:
+        return f"[{ts}] runner_woke_up {task_tag}reason={p.get('reason', 'cooldown_complete')}"
+
+    if et == EventType.PROXY_STATUS_CHANGED:
+        return (
+            f"[{ts}] proxy_status_changed state={p.get('state')} "
+            f"route={p.get('active_route') or '-'}"
+        )
+
+    if et == EventType.PROXY_ERROR:
+        msg = str(p.get("message", ""))[:160].replace("\n", " ")
+        return f"[{ts}] proxy_error state={p.get('state')} {msg}"
+
     if et == EventType.RUN_FINISHED:
         return f"[{ts}] run_finished tasks_processed={p.get('tasks_processed', 0)}"
 
@@ -359,6 +424,8 @@ class EventBus:
                 previous_state.last_control_command_id if previous_state else None
             ),
             provider_quotas=dict(self.quota_tracker.quotas),
+            active_accounts=dict(previous_state.active_accounts) if previous_state else {},
+            proxy_health_status=previous_state.proxy_health_status if previous_state else None,
         )
         if not defer_save:
             self.save_state()

@@ -149,10 +149,16 @@ class EventType(StrEnum):
     TASK_CLAIMED = "task_claimed"
     TASK_STATUS_CHANGED = "task_status_changed"
     PROVIDER_INVOKED = "provider_invoked"
+    PROVIDER_RESPONSE_STARTED = "provider_response_started"
+    PROVIDER_RECOVERED_AFTER_RETRY = "provider_recovered_after_retry"
     PROVIDER_SUCCEEDED = "provider_succeeded"
     PROVIDER_FAILED = "provider_failed"
     PROVIDER_RATE_LIMITED = "provider_rate_limited"
+    PROVIDER_TRANSPORT_RETRY = "provider_transport_retry"
     PROVIDER_TRANSIENT_RETRY = "provider_transient_retry"
+    PROVIDER_FALLBACK_USED = "provider_fallback_used"
+    PROVIDER_ACCOUNT_SWITCHED = "provider_account_switched"
+    PROVIDER_ACCOUNT_SWITCH_FAILED = "provider_account_switch_failed"
     AGENT_COMMIT_SOFT_RESET = "agent_commit_soft_reset"
     STALE_LOCK_RECOVERED = "stale_lock_recovered"
     CRASH_RECOVERY_COMPLETED = "crash_recovery_completed"
@@ -162,6 +168,7 @@ class EventType(StrEnum):
     PLACEHOLDER_GUARD_FAILED = "placeholder_guard_failed"
     RED_ZONE_VIOLATION = "red_zone_violation"
     YELLOW_ZONE_TRIGGERED = "yellow_zone_triggered"
+    DIFF_GUARD_SOFT_WARNING = "diff_guard_soft_warning"
     DIFF_GUARD_FAILED = "diff_guard_failed"
     PRE_REVIEW_COMPLETED = "pre_review_completed"
     REVIEW_COMPLETED = "review_completed"
@@ -181,6 +188,10 @@ class EventType(StrEnum):
     INBOX_CONSUMED = "inbox_consumed"
     PAUSE_ENTERED = "pause_entered"
     PAUSE_RESUMED = "pause_resumed"
+    RUNNER_HIBERNATING = "runner_hibernating"
+    RUNNER_WOKE_UP = "runner_woke_up"
+    PROXY_STATUS_CHANGED = "proxy_status_changed"
+    PROXY_ERROR = "proxy_error"
     REPORT_GENERATED = "report_generated"
 
 
@@ -204,10 +215,28 @@ class ProviderQuotaState(BaseModel):
     last_rate_limited_at: str | None = None
 
 
+class ProxyHealthStatus(BaseModel):
+    """Normalized health snapshot from the declarative external proxy monitor."""
+
+    healthy: bool = True
+    state: str = "unknown"
+    proxy_reachable: bool | None = None
+    active_route: str | None = None
+    last_message: str | None = None
+    last_ok_at: str | None = None
+    route_switching: bool = False
+    requires_manual_action: bool = False
+    fatal_reason: str | None = None
+    blockers: list[str] = Field(default_factory=list)
+    raw_excerpt: str = ""
+    checked_at: str = Field(default_factory=utc_now_iso)
+
+
 class RunStatus(StrEnum):
     IDLE = "idle"
     RUNNING = "running"
     PAUSED = "paused"
+    HIBERNATING = "hibernating"
     COMPLETED = "completed"
     ABORTED = "aborted"
     FAILED = "failed"
@@ -231,6 +260,8 @@ class PipelineState(BaseModel):
     processed_control_ids: list[str] = Field(default_factory=list)
     last_control_command_id: str | None = None
     provider_quotas: dict[str, ProviderQuotaState] = Field(default_factory=dict)
+    active_accounts: dict[str, str] = Field(default_factory=dict)
+    proxy_health_status: ProxyHealthStatus | None = None
     updated_at: str = Field(default_factory=utc_now_iso)
 
 

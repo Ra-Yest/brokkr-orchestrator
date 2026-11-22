@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import codecs
 import contextlib
 import ctypes
 import os
@@ -10,10 +11,72 @@ import shutil
 import signal
 import subprocess
 import sys
+import threading
 import time
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
+
+_ANSI_ESCAPE_RE = re.compile(
+    r"(?:\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[@-Z\\-_])"
+)
+
+_DEFAULT_WORKSPACE_WATCH_IGNORES: frozenset[str] = frozenset(
+    {
+        ".git",
+        ".pipeline",
+        ".venv",
+        "venv",
+        "node_modules",
+        "__pycache__",
+        ".pytest_cache",
+        ".mypy_cache",
+        ".ruff_cache",
+    }
+)
+
+
+def strip_ansi(text: str) -> str:
+    """Strip ANSI escape sequences and carriage returns from CLI output."""
+    return _ANSI_ESCAPE_RE.sub("", text).replace("\r", "")
+
+
+def is_meaningful_output(chunk: str) -> bool:
+    """Return True if chunk contains non-whitespace content after stripping ANSI codes."""
+    return bool(strip_ansi(chunk).strip())
+
+
+def _workspace_activity_signature(
+    watch_dir: Path,
+    ignore_dirs: set[str] | frozenset[str],
+) -> tuple[int, float]:
+    """Return (entry_count, latest_mtime) for files/dirs outside ignored directories."""
+    count = 0
+    latest_mtime = 0.0
+    try:
+        stack: list[Path] = [watch_dir]
+        while stack:
+            current = stack.pop()
+            try:
+                with os.scandir(current) as it:
+                    for entry in it:
+                        name = entry.name
+                        if name in ignore_dirs:
+                            continue
+                        try:
+                            stat = entry.stat(follow_symlinks=False)
+                        except OSError:
+                            continue
+                        count += 1
+                        if stat.st_mtime > latest_mtime:
+                            latest_mtime = stat.st_mtime
+                        if entry.is_dir(follow_symlinks=False):
+                            stack.append(Path(entry.path))
+            except OSError:
+                continue
+    except OSError:
+        pass
+    return count, latest_mtime
 
 
 @dataclass(frozen=True)
@@ -23,13 +86,17 @@ class ProcessRunResult:
     stderr: str
     duration_seconds: float
     timed_out: bool
+    idle_timed_out: bool = False
+    received_meaningful_output: bool = False
 
 
 def resolve_executable(
     command: list[str],
     env: Mapping[str, str] | None = None,
+    *,
+    cwd: Path | None = None,
 ) -> list[str]:
-    """Resolve the executable via shutil.which so Windows .cmd/.bat wrappers work without shell=True."""
+    """Resolve the executable via shutil.which or relative repo path so Windows wrappers work without shell=True."""
     if not command:
         raise ValueError("Command must not be empty")
     exe = command[0]
@@ -37,6 +104,13 @@ def resolve_executable(
     resolved = shutil.which(exe, path=path_env)
     if resolved is not None:
         return [resolved, *command[1:]]
+    if cwd is not None:
+        local_candidate = Path(exe) if Path(exe).is_absolute() else (cwd / exe)
+        local_resolved = shutil.which(str(local_candidate))
+        if local_resolved is not None:
+            return [local_resolved, *command[1:]]
+        if local_candidate.is_file():
+            return [str(local_candidate), *command[1:]]
     return list(command)
 
 
@@ -129,7 +203,7 @@ if sys.platform == "win32":
                 self._handle = None
 
 
-def _kill_process_tree(proc: subprocess.Popen[str], job: object | None = None) -> None:
+def _kill_process_tree(proc: subprocess.Popen[bytes], job: object | None = None) -> None:
     """Terminate a process and all its children reliably across Windows and POSIX."""
     if sys.platform == "win32":
         if job is not None and hasattr(job, "terminate"):
@@ -163,14 +237,6 @@ def _kill_process_tree(proc: subprocess.Popen[str], job: object | None = None) -
             proc.kill()
 
 
-def _decode_stream_chunk(chunk: str | bytes | None) -> str:
-    if chunk is None:
-        return ""
-    if isinstance(chunk, bytes):
-        return chunk.decode("utf-8", errors="replace")
-    return chunk
-
-
 def run_noninteractive_process(
     command: list[str],
     *,
@@ -178,8 +244,14 @@ def run_noninteractive_process(
     env: Mapping[str, str] | None = None,
     stdin_data: str | None = None,
     timeout_seconds: int = 900,
+    idle_timeout_seconds: float | None = None,
+    on_first_output: Callable[[str], None] | None = None,
+    on_stdout_chunk: Callable[[str], None] | None = None,
+    on_stderr_chunk: Callable[[str], None] | None = None,
+    workspace_watch_dir: Path | None = None,
+    workspace_ignore_dirs: set[str] | frozenset[str] | None = None,
 ) -> ProcessRunResult:
-    """Run a subprocess in strict non-interactive mode with guaranteed process-tree cleanup."""
+    """Run a subprocess in strict non-interactive mode with streaming stdout/stderr and idle/hard timeout."""
     merged_env = dict(os.environ)
     if env is not None:
         merged_env.update(env)
@@ -189,7 +261,7 @@ def run_noninteractive_process(
     merged_env.setdefault("PYTHONIOENCODING", "utf-8")
     merged_env.setdefault("PYTHONDONTWRITEBYTECODE", "1")
 
-    resolved_cmd = resolve_executable(command, env=merged_env)
+    resolved_cmd = resolve_executable(command, env=merged_env, cwd=cwd)
     stdin_arg = subprocess.PIPE if stdin_data is not None else subprocess.DEVNULL
 
     start_time = time.monotonic()
@@ -201,9 +273,7 @@ def run_noninteractive_process(
         "stdin": stdin_arg,
         "stdout": subprocess.PIPE,
         "stderr": subprocess.PIPE,
-        "text": True,
-        "encoding": "utf-8",
-        "errors": "replace",
+        "bufsize": 0,
         "shell": False,
     }
     if sys.platform == "win32":
@@ -213,7 +283,7 @@ def run_noninteractive_process(
     else:
         popen_kwargs["start_new_session"] = True
 
-    proc: subprocess.Popen[str] = subprocess.Popen(resolved_cmd, **popen_kwargs)  # type: ignore[call-overload]
+    proc: subprocess.Popen[bytes] = subprocess.Popen(resolved_cmd, **popen_kwargs)  # type: ignore[call-overload]
     if sys.platform == "win32":
         win_job = _WindowsJobObject()
         handle = getattr(proc, "_handle", None)
@@ -221,30 +291,187 @@ def run_noninteractive_process(
             win_job.assign(int(handle))
         job = win_job
 
+    lock = threading.Lock()
+    stdout_chunks: list[str] = []
+    stderr_chunks: list[str] = []
+    last_activity = [start_time]
+    received_meaningful = [False]
+
+    def _write_stdin() -> None:
+        if proc.stdin is None or stdin_data is None:
+            return
+        try:
+            proc.stdin.write(stdin_data.encode("utf-8"))
+            proc.stdin.flush()
+        except OSError:
+            pass
+        finally:
+            with contextlib.suppress(OSError):
+                proc.stdin.close()
+
+    def _read_stream(
+        stream: object,
+        *,
+        is_stdout: bool,
+    ) -> None:
+        if stream is None:
+            return
+        decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+        try:
+            fd = stream.fileno()  # type: ignore[attr-defined]
+        except Exception:
+            fd = None
+
+        try:
+            while True:
+                try:
+                    raw = os.read(fd, 4096) if fd is not None else stream.read(4096)  # type: ignore[attr-defined]
+                except OSError:
+                    break
+                if not raw:
+                    break
+                text = decoder.decode(raw, final=False)
+                if not text:
+                    with lock:
+                        last_activity[0] = time.monotonic()
+                    continue
+                fire_first = False
+                with lock:
+                    last_activity[0] = time.monotonic()
+                    if is_stdout:
+                        stdout_chunks.append(text)
+                        if not received_meaningful[0] and is_meaningful_output(text):
+                            received_meaningful[0] = True
+                            fire_first = True
+                    else:
+                        stderr_chunks.append(text)
+                if fire_first and on_first_output is not None:
+                    with contextlib.suppress(Exception):
+                        on_first_output(text)
+                if is_stdout and on_stdout_chunk is not None:
+                    with contextlib.suppress(Exception):
+                        on_stdout_chunk(text)
+                elif not is_stdout and on_stderr_chunk is not None:
+                    with contextlib.suppress(Exception):
+                        on_stderr_chunk(text)
+        finally:
+            tail = decoder.decode(b"", final=True)
+            if tail:
+                fire_first_tail = False
+                with lock:
+                    if is_stdout:
+                        stdout_chunks.append(tail)
+                        if not received_meaningful[0] and is_meaningful_output(tail):
+                            received_meaningful[0] = True
+                            fire_first_tail = True
+                    else:
+                        stderr_chunks.append(tail)
+                if fire_first_tail and on_first_output is not None:
+                    with contextlib.suppress(Exception):
+                        on_first_output(tail)
+            with contextlib.suppress(OSError):
+                stream.close()  # type: ignore[attr-defined]
+
+    stdin_thread: threading.Thread | None = None
+    if stdin_data is not None:
+        stdin_thread = threading.Thread(target=_write_stdin, daemon=True)
+        stdin_thread.start()
+
+    stdout_thread = threading.Thread(
+        target=_read_stream,
+        args=(proc.stdout,),
+        kwargs={"is_stdout": True},
+        daemon=True,
+    )
+    stderr_thread = threading.Thread(
+        target=_read_stream,
+        args=(proc.stderr,),
+        kwargs={"is_stdout": False},
+        daemon=True,
+    )
+    stdout_thread.start()
+    stderr_thread.start()
+
+    watch_dir = workspace_watch_dir if workspace_watch_dir is not None else cwd
+    ignore_set = (
+        workspace_ignore_dirs
+        if workspace_ignore_dirs is not None
+        else _DEFAULT_WORKSPACE_WATCH_IGNORES
+    )
+    last_ws_sig = (
+        _workspace_activity_signature(watch_dir, ignore_set)
+        if idle_timeout_seconds is not None
+        else None
+    )
+    last_ws_check = start_time
+    ws_check_interval = (
+        min(1.0, max(0.05, idle_timeout_seconds / 4.0))
+        if idle_timeout_seconds is not None
+        else 1.0
+    )
+    poll_interval = (
+        min(0.1, max(0.02, idle_timeout_seconds / 10.0))
+        if idle_timeout_seconds is not None
+        else 0.1
+    )
+
     timed_out = False
-    stdout = ""
-    stderr = ""
+    idle_timed_out = False
     exit_code = -1
 
     try:
-        stdout, stderr = proc.communicate(input=stdin_data, timeout=timeout_seconds)
-        exit_code = proc.returncode if proc.returncode is not None else -1
-    except subprocess.TimeoutExpired as exc:
-        timed_out = True
-        _kill_process_tree(proc, job=job)
-        partial_out = _decode_stream_chunk(exc.stdout)
-        partial_err = _decode_stream_chunk(exc.stderr)
-        try:
-            rem_out, rem_err = proc.communicate(timeout=5)
-            stdout = partial_out + _decode_stream_chunk(rem_out)
-            stderr = partial_err + _decode_stream_chunk(rem_err)
-        except subprocess.TimeoutExpired:
-            stdout = partial_out
-            stderr = partial_err
-        exit_code = proc.returncode if proc.returncode is not None else -1
+        while True:
+            rc = proc.poll()
+            if rc is not None:
+                exit_code = rc
+                break
+            now = time.monotonic()
+            if now - start_time >= timeout_seconds:
+                timed_out = True
+                _kill_process_tree(proc, job=job)
+                with contextlib.suppress(subprocess.TimeoutExpired):
+                    proc.wait(timeout=5)
+                exit_code = proc.returncode if proc.returncode is not None else -1
+                break
+            if idle_timeout_seconds is not None:
+                if now - last_ws_check >= ws_check_interval:
+                    cur_sig = _workspace_activity_signature(watch_dir, ignore_set)
+                    last_ws_check = now
+                    if last_ws_sig is not None and cur_sig != last_ws_sig:
+                        last_ws_sig = cur_sig
+                        with lock:
+                            last_activity[0] = now
+                with lock:
+                    idle_for = now - last_activity[0]
+                if idle_for >= idle_timeout_seconds:
+                    # Final workspace mtime check before killing
+                    cur_sig = _workspace_activity_signature(watch_dir, ignore_set)
+                    if last_ws_sig is not None and cur_sig != last_ws_sig:
+                        last_ws_sig = cur_sig
+                        with lock:
+                            last_activity[0] = now
+                    else:
+                        timed_out = True
+                        idle_timed_out = True
+                        _kill_process_tree(proc, job=job)
+                        with contextlib.suppress(subprocess.TimeoutExpired):
+                            proc.wait(timeout=5)
+                        exit_code = proc.returncode if proc.returncode is not None else -1
+                        break
+            time.sleep(poll_interval)
     finally:
+        join_timeout = 5.0 if timed_out else 15.0
+        stdout_thread.join(timeout=join_timeout)
+        stderr_thread.join(timeout=join_timeout)
+        if stdin_thread is not None:
+            stdin_thread.join(timeout=2.0)
         if sys.platform == "win32" and job is not None and hasattr(job, "close"):
             job.close()
+
+    with lock:
+        stdout = "".join(stdout_chunks).replace("\r\n", "\n")
+        stderr = "".join(stderr_chunks).replace("\r\n", "\n")
+        meaningful = received_meaningful[0]
 
     duration = time.monotonic() - start_time
     return ProcessRunResult(
@@ -253,6 +480,8 @@ def run_noninteractive_process(
         stderr=stderr,
         duration_seconds=duration,
         timed_out=timed_out,
+        idle_timed_out=idle_timed_out,
+        received_meaningful_output=meaningful,
     )
 
 

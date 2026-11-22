@@ -5,9 +5,11 @@ from __future__ import annotations
 import contextlib
 import json
 import os
+import random
 import re
 import time
-from datetime import UTC, datetime
+from collections.abc import Callable
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Literal, TextIO
 
@@ -25,17 +27,20 @@ from orchestrator.fs_utils import (
     atomic_write_text,
     diff_directory_snapshots,
     normalize_newlines,
+    sha256_file,
     snapshot_directory_hashes,
 )
 from orchestrator.gates import GateRunner
 from orchestrator.git_ops import GitChange, GitOperationError, GitOps
 from orchestrator.models import (
     READ_ONLY_ROLES,
+    WRITING_ROLES,
     AgentRole,
     ControlAction,
     ControlCommand,
     EventType,
     ParsedWorkerOutput,
+    ProxyHealthStatus,
     ReviewVerdictType,
     RunStatus,
     Task,
@@ -51,9 +56,20 @@ from orchestrator.output_parser import (
     parse_single_review_verdict,
     parse_worker_output,
 )
-from orchestrator.process_utils import cleanup_ports, is_process_alive
+from orchestrator.process_utils import (
+    cleanup_ports,
+    is_meaningful_output,
+    is_process_alive,
+    run_noninteractive_process,
+)
 from orchestrator.prompt_builder import BuiltPrompt, PromptBuilder, generate_repo_map
-from orchestrator.providers.base import ProviderRegistry, ProviderRequest, ProviderResponse
+from orchestrator.providers.base import (
+    BaseAgentProvider,
+    ProviderRegistry,
+    ProviderRequest,
+    ProviderResponse,
+)
+from orchestrator.proxy_monitor import BaseProxyMonitor, build_proxy_monitor
 from orchestrator.reporter import write_report
 from orchestrator.stores.base import BaseTaskStore
 
@@ -69,7 +85,9 @@ _TRANSIENT_ERROR_RE = re.compile(
     r"(?:\b502\b|\b503\b|\b504\b|bad\s+gateway|service\s+unavailable|"
     r"gateway\s+timeout|connection\s+reset|econnreset|etimedout|"
     r"broken\s+pipe|\beof\b|temporary\s+failure|network|connection\s+refused|"
-    r"econnrefused|socket\s+hang\s+up|tls\s+handshake|remote\s+disconnected)",
+    r"econnrefused|socket\s+hang\s+up|tls\s+handshake|remote\s+disconnected|"
+    r"proxy|fetch\s+failed|unable\s+to\s+connect|could\s+not\s+connect|"
+    r"dns\s+resolution|getaddrinfo)",
     re.IGNORECASE,
 )
 
@@ -86,9 +104,9 @@ def classify_provider_failure(
     response: ProviderResponse,
 ) -> Literal["none", "timeout", "permanent", "transient"]:
     """Classify a failed provider response as permanent (fail-fast), transient (retry), or timeout."""
-    if response.exit_code == 0 and not response.timed_out:
+    if response.exit_code == 0 and not response.timed_out and not response.idle_timed_out:
         return "none"
-    if response.timed_out:
+    if response.timed_out or response.idle_timed_out:
         return "timeout"
     combined = f"{response.raw_stderr}\n{response.raw_stdout}"
     if _PERMANENT_ERROR_RE.search(combined):
@@ -99,6 +117,37 @@ def classify_provider_failure(
     if not combined.strip() or not response.parsed_text.strip() or response.exit_code < 0:
         return "transient"
     return "permanent"
+
+
+def is_transport_failure_before_response(
+    response: ProviderResponse,
+    *,
+    max_duration_seconds: int,
+    git_tree_changed: bool,
+    proxy_route_switching: bool = False,
+) -> bool:
+    """Return True if the call failed before producing work and qualifies for a free transport retry."""
+    if (
+        response.exit_code == 0
+        or response.timed_out
+        or response.idle_timed_out
+        or response.rate_limited
+    ):
+        return False
+    if classify_provider_failure(response) == "permanent":
+        return False
+    if response.duration_seconds >= max_duration_seconds:
+        return False
+    if git_tree_changed:
+        return False
+    if proxy_route_switching:
+        return True
+    combined = f"{response.raw_stderr}\n{response.raw_stdout}"
+    if _TRANSIENT_ERROR_RE.search(combined):
+        return True
+    return (not response.received_meaningful_output) and (
+        not is_meaningful_output(response.raw_stdout)
+    )
 
 
 class OrchestratorFatalError(RuntimeError):
@@ -114,18 +163,20 @@ class _AbortedByControlError(Exception):
 
 
 class _PausedByInfraError(Exception):
-    """Raised when a review/architect/planner provider fails after retries so work is preserved."""
+    """Raised when a review/architect/planner/proxy monitor fails so work is preserved."""
 
     def __init__(
         self,
         reason: str,
         *,
+        pause_reason: str | None = None,
         task_id: str | None = None,
         role: AgentRole | None = None,
         provider: str | None = None,
     ) -> None:
         super().__init__(reason)
         self.reason = reason
+        self.pause_reason = pause_reason or reason
         self.task_id = task_id
         self.role = role
         self.provider = provider
@@ -145,7 +196,9 @@ class OrchestratorRunner:
         git_ops: GitOps | None = None,
         gate_runner: GateRunner | None = None,
         notifier: BaseNotifier | None = None,
+        proxy_monitor: BaseProxyMonitor | None = None,
         sleep_fn: Any = None,
+        jitter_fn: Callable[[float], float] | None = None,
         quiet: bool = False,
         console_stream: TextIO | None = None,
     ) -> None:
@@ -173,7 +226,15 @@ class OrchestratorRunner:
         self.control_plane = ControlPlane(self.pipeline_dir)
         self.inbox_manager = InboxManager(self.pipeline_dir)
         self.notifier = notifier or build_notifier(config.notifications)
+        self.proxy_monitor: BaseProxyMonitor | None = (
+            proxy_monitor
+            if proxy_monitor is not None
+            else build_proxy_monitor(config.proxy_monitor)
+        )
         self._sleep = sleep_fn or time.sleep
+        self._jitter: Callable[[float], float] = jitter_fn or (
+            lambda d: max(0.0, d * random.uniform(0.85, 1.15)) if d > 0 else 0.0
+        )
 
         self.repo_map_path = self.pipeline_dir / "REPO_MAP.md"
         self.progress_path = self.pipeline_dir / "PROGRESS.md"
@@ -185,6 +246,7 @@ class OrchestratorRunner:
         self._abort_requested = False
         self._batch_diffs: dict[str, str] = {}
         self._attempt_counter: dict[str, int] = {}
+        self._last_proxy_key: tuple[str, bool, bool, str | None] | None = None
 
     def _acquire_runner_lock(self) -> dict[str, Any] | None:
         """Acquire `.pipeline/runner.lock`. Raises RunnerLockError if an active PID holds it."""
@@ -375,7 +437,7 @@ class OrchestratorRunner:
                 status=RunStatus.PAUSED,
                 active_phase="paused_infra",
                 paused=True,
-                pause_reason=exc.reason,
+                pause_reason=exc.pause_reason,
                 resume_at=None,
             )
             self.event_bus.emit(
@@ -383,7 +445,7 @@ class OrchestratorRunner:
                 task_id=exc.task_id,
                 role=exc.role,
                 provider=exc.provider,
-                payload={"reason": exc.reason},
+                payload={"reason": exc.pause_reason, "details": exc.reason},
             )
             self._generate_report()
             self.notifier.notify(
@@ -484,6 +546,7 @@ class OrchestratorRunner:
             bool(unfinished_tasks)
             or (active_task is not None and active_task.status == TaskStatus.ARCH_PENDING)
             or (self.event_bus.state.active_phase == "refactorer")
+            or (base_sha is not None and self.git_ops.has_uncommitted_changes())
         )
 
         rollback_sha: str | None = None
@@ -737,6 +800,16 @@ class OrchestratorRunner:
 
         return "unsupported action"
 
+    def _check_control_after_step(self) -> None:
+        """Process control commands immediately after a provider step, honoring abort & pause_after_current."""
+        self._process_control_commands()
+        if self._abort_requested:
+            raise _AbortedByControlError()
+        if self.event_bus.state.pause_after_current or self.event_bus.state.paused:
+            self._wait_while_paused(reason="operator_pause")
+            if self._abort_requested:
+                raise _AbortedByControlError()
+
     def _wait_while_paused(self, *, reason: str) -> None:
         self.event_bus.update_state(
             status=RunStatus.PAUSED,
@@ -756,50 +829,68 @@ class OrchestratorRunner:
         if not self._abort_requested:
             self.event_bus.update_state(status=RunStatus.RUNNING)
 
-    def _wait_rate_limit_cooldown(
+    def _hibernate_until(
         self,
         *,
-        provider_name: str,
-        cooldown_seconds: int,
+        resume_dt: datetime,
+        providers: list[str],
         task_id: str | None,
         role: AgentRole,
     ) -> None:
-        resume_dt = self.event_bus.quota_tracker.record_rate_limit(
-            provider_name,
-            cooldown_seconds=cooldown_seconds,
-        )
+        """Enter hibernating state when all providers for a role are rate-limited / quota-capped."""
+        now = datetime.now(UTC)
+        wait_seconds = max(1, int((resume_dt - now).total_seconds()))
         resume_iso = resume_dt.isoformat().replace("+00:00", "Z")
+        local_resume = resume_dt.astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
+        providers_label = ", ".join(providers)
+
         self.event_bus.update_state(
-            status=RunStatus.PAUSED,
+            status=RunStatus.HIBERNATING,
+            active_task_id=task_id,
+            active_phase="hibernating",
+            active_role=role,
             paused=True,
-            pause_reason=f"rate_limit:{provider_name}",
+            pause_reason=f"rate_limit:{providers_label}",
             resume_at=resume_iso,
         )
         self.event_bus.emit(
-            EventType.PAUSE_ENTERED,
+            EventType.RUNNER_HIBERNATING,
             task_id=task_id,
             role=role,
-            provider=provider_name,
-            payload={"reason": "rate_limit", "cooldown_seconds": cooldown_seconds, "resume_at": resume_iso},
+            provider=providers[0] if providers else None,
+            payload={
+                "providers": providers,
+                "cooldown_seconds": wait_seconds,
+                "resume_at": resume_iso,
+            },
         )
         task_suffix = f" on #{task_id}" if task_id else ""
         self.notifier.notify(
-            "pause",
-            f"Rate Limit Pause ({self.config.project.name})",
-            f"Provider '{provider_name}' rate-limited{task_suffix}. "
-            f"Cooldown: {cooldown_seconds}s (resume at {resume_iso}).",
+            "hibernation",
+            f"Rate Limit Pause / Hibernating ({self.config.project.name})",
+            f"All provider(s) [{providers_label}] rate-limited/quota-capped{task_suffix}. "
+            f"Hibernating for {wait_seconds}s; wake-up at {resume_iso} ({local_resume}).",
+        )
+
+        wake_reason = "cooldown_complete"
+        poll_step = min(
+            self.config.workflow.control_poll_seconds,
+            self.config.workflow.rate_limit_poll_seconds,
         )
         while not self._abort_requested:
             self._process_control_commands()
             if self._abort_requested:
                 break
             if not self.event_bus.state.paused:
-                # Operator explicitly issued `resume`
+                # Operator explicitly issued `resume` -> clear cooldowns so runner wakes immediately
+                for pname in providers:
+                    self.event_bus.quota_tracker.clear_cooldown(pname)
+                wake_reason = "operator_resume"
                 break
             remaining = (resume_dt - datetime.now(UTC)).total_seconds()
             if remaining <= 0:
                 break
-            self._sleep(min(self.config.workflow.rate_limit_poll_seconds, remaining))
+            self._sleep(min(poll_step, remaining))
 
         if not self._abort_requested:
             self.event_bus.update_state(
@@ -809,11 +900,11 @@ class OrchestratorRunner:
                 resume_at=None,
             )
             self.event_bus.emit(
-                EventType.PAUSE_RESUMED,
+                EventType.RUNNER_WOKE_UP,
                 task_id=task_id,
                 role=role,
-                provider=provider_name,
-                payload={"reason": "rate_limit_complete"},
+                provider=providers[0] if providers else None,
+                payload={"reason": wake_reason, "providers": providers},
             )
 
     def _wait_backoff(
@@ -823,11 +914,12 @@ class OrchestratorRunner:
         provider_name: str,
         task_id: str | None,
         role: AgentRole,
+        phase_prefix: str = "transient_backoff",
     ) -> None:
-        """Sleep for transient backoff in short ticks, polling control_inbox for immediate abort."""
+        """Sleep for backoff in short ticks, polling control_inbox for immediate abort/pause."""
         self.event_bus.update_state(
             active_task_id=task_id,
-            active_phase=f"transient_backoff:{provider_name}",
+            active_phase=f"{phase_prefix}:{provider_name}",
             active_role=role,
             active_provider=provider_name,
         )
@@ -837,6 +929,10 @@ class OrchestratorRunner:
             self._process_control_commands()
             if self._abort_requested:
                 raise _AbortedByControlError()
+            if self.event_bus.state.pause_after_current or self.event_bus.state.paused:
+                self._wait_while_paused(reason="operator_pause")
+                if self._abort_requested:
+                    raise _AbortedByControlError()
             step = min(poll, delay_seconds - slept_total)
             if step <= 0:
                 break
@@ -845,6 +941,261 @@ class OrchestratorRunner:
         self._process_control_commands()
         if self._abort_requested:
             raise _AbortedByControlError()
+
+    # -------------------------------------------------------------------------
+    # Provider Fallback, Account Switching & Proxy Monitor Helpers
+    # -------------------------------------------------------------------------
+
+    def _candidate_providers_for_role(self, role: AgentRole) -> list[str]:
+        """Return ordered candidate profile names [primary, *compatible_fallbacks] for a role."""
+        primary = self.registry.profile_name_for_role(role)
+        raw_fallbacks: list[str] = [
+            *self.config.fallback_providers.get(role, []),
+            *self.config.providers[primary].fallback_providers,
+        ]
+        ordered: list[str] = [primary]
+        for fb_name in raw_fallbacks:
+            if fb_name in ordered:
+                continue
+            if fb_name not in self.config.providers:
+                continue
+            fb_profile = self.config.providers[fb_name]
+            if role in WRITING_ROLES and not fb_profile.can_edit_files:
+                continue
+            ordered.append(fb_name)
+        return ordered
+
+    def _select_available_provider_for_role(
+        self,
+        role: AgentRole,
+        *,
+        exclude: set[str] | None = None,
+    ) -> tuple[str, int, list[str]]:
+        """Return (chosen_provider_name, wait_seconds, all_candidates)."""
+        candidates = self._candidate_providers_for_role(role)
+        skip = exclude or set()
+        for cand in candidates:
+            if cand in skip:
+                continue
+            if self.event_bus.quota_tracker.seconds_until_available(cand) == 0:
+                return cand, 0, candidates
+
+        best_name = candidates[0]
+        best_wait = self.event_bus.quota_tracker.seconds_until_available(best_name)
+        for cand in candidates[1:]:
+            wait = self.event_bus.quota_tracker.seconds_until_available(cand)
+            if wait < best_wait:
+                best_name = cand
+                best_wait = wait
+        return best_name, best_wait, candidates
+
+    def _poll_proxy_monitor_for_provider(
+        self,
+        provider: BaseAgentProvider,
+        *,
+        task_id: str | None,
+        role: AgentRole,
+    ) -> ProxyHealthStatus | None:
+        """Read external proxy monitor status if enabled & applicable, persisting state and alerts."""
+        if self.proxy_monitor is None:
+            return None
+        if not self.proxy_monitor.applies_to(provider.name, provider.profile):
+            return None
+
+        status = self.proxy_monitor.read_status()
+        self.event_bus.update_state(proxy_health_status=status)
+
+        key = (
+            status.state,
+            status.healthy,
+            status.requires_manual_action,
+            status.last_message,
+        )
+        prev_key = self._last_proxy_key
+        if key != prev_key:
+            self._last_proxy_key = key
+            payload = {
+                "state": status.state,
+                "healthy": status.healthy,
+                "proxy_reachable": status.proxy_reachable,
+                "active_route": status.active_route,
+                "route_switching": status.route_switching,
+                "requires_manual_action": status.requires_manual_action,
+                "message": status.fatal_reason or status.last_message or "",
+                "blockers": status.blockers,
+            }
+            if not status.healthy or status.requires_manual_action:
+                self.event_bus.emit(
+                    EventType.PROXY_ERROR,
+                    task_id=task_id,
+                    role=role,
+                    provider=provider.name,
+                    payload=payload,
+                )
+                self.notifier.notify(
+                    "proxy",
+                    f"Proxy Monitor Error ({self.config.project.name})",
+                    f"State: {status.state}\n"
+                    f"Message: {status.fatal_reason or status.last_message or 'Proxy unhealthy'}\n"
+                    f"Route: {status.active_route or '-'}",
+                )
+            else:
+                self.event_bus.emit(
+                    EventType.PROXY_STATUS_CHANGED,
+                    task_id=task_id,
+                    role=role,
+                    provider=provider.name,
+                    payload=payload,
+                )
+                if prev_key is not None and not prev_key[1] and status.healthy:
+                    self.notifier.notify(
+                        "proxy",
+                        f"Proxy Monitor Recovered ({self.config.project.name})",
+                        f"Proxy monitor recovered (state={status.state}, route={status.active_route or '-'}).",
+                    )
+        return status
+
+    def _ensure_provider_account(
+        self,
+        provider: BaseAgentProvider,
+        *,
+        task_id: str | None,
+        role: AgentRole,
+    ) -> None:
+        """Run profile.switch_command when account_group/account_profile differs from active_accounts."""
+        group = provider.profile.account_group
+        target_profile = provider.profile.account_profile
+        switch_cmd = provider.profile.switch_command
+        if not group or not target_profile:
+            return
+
+        current_profile = self.event_bus.state.active_accounts.get(group)
+        if current_profile == target_profile:
+            return
+
+        try:
+            res = run_noninteractive_process(
+                switch_cmd,
+                cwd=self.repo_root,
+                timeout_seconds=30,
+            )
+            exit_code = res.exit_code
+            timed_out = res.timed_out
+            stderr_text = res.stderr.strip() or res.stdout.strip()
+        except OSError as exc:
+            exit_code = -1
+            timed_out = False
+            stderr_text = str(exc)
+
+        if exit_code == 0 and not timed_out:
+            updated_accounts = {**self.event_bus.state.active_accounts, group: target_profile}
+            self.event_bus.update_state(active_accounts=updated_accounts)
+            self.event_bus.emit(
+                EventType.PROVIDER_ACCOUNT_SWITCHED,
+                task_id=task_id,
+                role=role,
+                provider=provider.name,
+                payload={
+                    "account_group": group,
+                    "from_profile": current_profile,
+                    "to_profile": target_profile,
+                    "command": list(switch_cmd),
+                },
+            )
+            return
+
+        self.event_bus.emit(
+            EventType.PROVIDER_ACCOUNT_SWITCH_FAILED,
+            task_id=task_id,
+            role=role,
+            provider=provider.name,
+            payload={
+                "account_group": group,
+                "from_profile": current_profile,
+                "to_profile": target_profile,
+                "command": list(switch_cmd),
+                "exit_code": exit_code,
+                "timed_out": timed_out,
+                "stderr": stderr_text[:400],
+            },
+        )
+        self.notifier.notify(
+            "account_switch_failed",
+            f"Account Switch Failed ({self.config.project.name})",
+            f"Failed switching account group '{group}' to '{target_profile}' "
+            f"for provider '{provider.name}' (exit={exit_code}, timed_out={timed_out}): "
+            f"{stderr_text[:300]}",
+        )
+        raise OrchestratorFatalError(
+            f"Account switch failed for group '{group}' -> '{target_profile}' "
+            f"(provider '{provider.name}', exit={exit_code}, timed_out={timed_out}): {stderr_text[:300]}"
+        )
+
+    def _make_first_output_handler(
+        self,
+        *,
+        task_id: str | None,
+        role: AgentRole,
+        provider_name: str,
+        transport_retries: int,
+        pipeline_snapshot: dict[str, str],
+    ) -> tuple[list[bool], Callable[[str], None]]:
+        fired = [False]
+
+        def _on_first_output(chunk: str) -> None:
+            if fired[0]:
+                return
+            fired[0] = True
+            self.event_bus.update_state(
+                active_task_id=task_id,
+                active_phase=f"streaming:{role.value}",
+                active_role=role,
+                active_provider=provider_name,
+            )
+            self.event_bus.emit(
+                EventType.PROVIDER_RESPONSE_STARTED,
+                task_id=task_id,
+                role=role,
+                provider=provider_name,
+                payload={"first_chunk_chars": len(chunk)},
+            )
+            target_label = task_id or role.value
+            if transport_retries > 0:
+                self.event_bus.emit(
+                    EventType.PROVIDER_RECOVERED_AFTER_RETRY,
+                    task_id=task_id,
+                    role=role,
+                    provider=provider_name,
+                    payload={"transport_retries": transport_retries},
+                )
+                self.notifier.notify(
+                    "provider_recovered",
+                    f"Provider Recovered ({self.config.project.name})",
+                    f"[{provider_name}] восстановился после {transport_retries} "
+                    f"ретраев, начал отвечать по {target_label}",
+                )
+            else:
+                self.notifier.notify(
+                    "provider_started",
+                    f"Provider Started ({self.config.project.name})",
+                    f"[{provider_name}] начал отвечать по {target_label} ({role.value})",
+                )
+            # Refresh expected hashes for orchestrator-written state.json / events.jsonl
+            # so Integrity Guard does not flag our own streaming telemetry updates as agent tampering.
+            for own_path in (self.event_bus.state_path, self.event_bus.events_path):
+                if own_path.is_file():
+                    rel = own_path.relative_to(self.pipeline_dir).as_posix()
+                    with contextlib.suppress(OSError):
+                        pipeline_snapshot[rel] = sha256_file(own_path)
+
+        return fired, _on_first_output
+
+    def _snapshot_git_tree_state(self, base_sha: str) -> tuple[str, list[str], str]:
+        """Capture lightweight git state (HEAD, untracked files, working diff) to detect modifications."""
+        head_sha = self.git_ops.get_head_sha()
+        untracked = self.git_ops.list_untracked_files()
+        diff_text = self.git_ops.get_diff(base_sha)
+        return head_sha, untracked, diff_text
 
     # -------------------------------------------------------------------------
     # Guarded Provider Invocation (base_sha, untracked add -N, Integrity Guard)
@@ -862,20 +1213,35 @@ class OrchestratorRunner:
         allowed_paths: list[str] | None = None,
         preserve_existing_diff_for_readonly: bool = False,
     ) -> tuple[ProviderResponse, DiffGuardReport]:
-        provider = self.registry.for_role(role)
-        attempt_dir.mkdir(parents=True, exist_ok=True)
+        primary_name = self.registry.profile_name_for_role(role)
+        chosen_name, pre_wait, candidates = self._select_available_provider_for_role(role)
 
-        # Wait if provider is currently in cooldown or reached rolling quota ceiling
-        pre_wait = self.event_bus.quota_tracker.seconds_until_available(provider.name)
         if pre_wait > 0:
-            self._wait_rate_limit_cooldown(
-                provider_name=provider.name,
-                cooldown_seconds=pre_wait,
+            resume_dt = datetime.now(UTC) + timedelta(seconds=pre_wait)
+            self._hibernate_until(
+                resume_dt=resume_dt,
+                providers=candidates,
                 task_id=task_id,
                 role=role,
             )
             if self._abort_requested:
                 raise _AbortedByControlError()
+            chosen_name, _, candidates = self._select_available_provider_for_role(role)
+        elif chosen_name != primary_name:
+            self.event_bus.emit(
+                EventType.PROVIDER_FALLBACK_USED,
+                task_id=task_id,
+                role=role,
+                provider=chosen_name,
+                payload={
+                    "from_provider": primary_name,
+                    "to_provider": chosen_name,
+                    "reason": "quota_or_cooldown",
+                },
+            )
+
+        provider = self.registry.get(chosen_name)
+        attempt_dir.mkdir(parents=True, exist_ok=True)
 
         # For read-only roles running on a dirty working tree (worker edits awaiting review),
         # snapshot the exact git diff/status beforehand so we can detect ANY read-only mutation.
@@ -893,10 +1259,35 @@ class OrchestratorRunner:
             else base_sha
         )
         retry_delays = list(self.config.workflow.transient_retry_delays_seconds)
+        transport_delays = list(self.config.workflow.transport_retry_delays_seconds)
+        max_transport_retries = self.config.workflow.max_transport_retries
+        transport_retries = 0
         transient_attempt = 0
         readonly_timeout_retries = 0
 
         while True:
+            # Proxy monitor preflight before invoking governed providers
+            pre_proxy = self._poll_proxy_monitor_for_provider(
+                provider,
+                task_id=task_id,
+                role=role,
+            )
+            if pre_proxy is not None and pre_proxy.requires_manual_action:
+                raise _PausedByInfraError(
+                    reason=(
+                        pre_proxy.fatal_reason
+                        or pre_proxy.last_message
+                        or f"Proxy monitor requires manual action ({pre_proxy.state})"
+                    ),
+                    pause_reason="proxy_error",
+                    task_id=task_id,
+                    role=role,
+                    provider=provider.name,
+                )
+
+            # Switch account profile if configured and differs from active_accounts
+            self._ensure_provider_account(provider, task_id=task_id, role=role)
+
             self.event_bus.update_state(
                 active_task_id=task_id,
                 active_phase=f"provider:{role.value}",
@@ -912,15 +1303,25 @@ class OrchestratorRunner:
                     "static_prefix_sha256": built_prompt.static_prefix_sha256,
                     "prompt_chars": len(built_prompt.full_text),
                     "attempt_dir": str(attempt_dir),
+                    "transport_retry": transport_retries,
                 },
             )
-            self.event_bus.quota_tracker.record_request(provider.name)
-            self.event_bus.save_state()
+
+            # Snapshot git working tree before invocation to detect zero-edit transport failures
+            git_before_sig = self._snapshot_git_tree_state(base_sha)
 
             # Integrity Guard snapshot of protected `.pipeline/` files BEFORE agent runs
             pipeline_snapshot_before = snapshot_directory_hashes(
                 self.pipeline_dir,
                 exclude=PIPELINE_INTEGRITY_EXCLUDES,
+            )
+
+            first_output_fired, _on_first_output = self._make_first_output_handler(
+                task_id=task_id,
+                role=role,
+                provider_name=provider.name,
+                transport_retries=transport_retries,
+                pipeline_snapshot=pipeline_snapshot_before,
             )
 
             dynamic_body = "\n\n===\n\n".join(
@@ -938,11 +1339,22 @@ class OrchestratorRunner:
                 static_prefix_sha256=built_prompt.static_prefix_sha256,
                 workdir=self.repo_root,
                 timeout_seconds=provider.profile.timeout_seconds,
+                idle_timeout_seconds=provider.profile.idle_timeout_seconds,
                 attempt_dir=attempt_dir,
+                on_first_output=_on_first_output,
             )
 
             # FileNotFoundError is a permanent configuration error -> fail-fast without retry
             response = provider.invoke(request)
+
+            # Emit provider_response_started / recovered for non-streaming providers (API/mock)
+            if (
+                not first_output_fired[0]
+                and response.exit_code == 0
+                and not response.timed_out
+                and (response.received_meaningful_output or is_meaningful_output(response.raw_stdout))
+            ):
+                _on_first_output(response.raw_stdout[:120])
 
             # Integrity Guard check AFTER agent runs (agents must NEVER touch protected `.pipeline/` files)
             pipeline_snapshot_after = snapshot_directory_hashes(
@@ -953,9 +1365,16 @@ class OrchestratorRunner:
                 pipeline_snapshot_before,
                 pipeline_snapshot_after,
             )
+            git_after_sig = self._snapshot_git_tree_state(base_sha)
+            git_tree_changed = git_after_sig != git_before_sig
 
             if response.rate_limited:
                 cooldown = response.retry_after_seconds or provider.profile.rate_limit_cooldown_seconds
+                self.event_bus.quota_tracker.record_rate_limit(
+                    provider.name,
+                    cooldown_seconds=cooldown,
+                )
+                self.event_bus.save_state()
                 self.event_bus.emit(
                     EventType.PROVIDER_RATE_LIMITED,
                     task_id=task_id,
@@ -963,15 +1382,128 @@ class OrchestratorRunner:
                     provider=provider.name,
                     payload={"cooldown_seconds": cooldown, "stderr": response.raw_stderr[:400]},
                 )
-                self._wait_rate_limit_cooldown(
-                    provider_name=provider.name,
-                    cooldown_seconds=cooldown,
+                self._check_control_after_step()
+
+                # Try fallback provider first before hibernating
+                next_name, next_wait, all_candidates = self._select_available_provider_for_role(
+                    role,
+                    exclude={provider.name},
+                )
+                if next_wait == 0 and next_name != provider.name:
+                    prev_name = provider.name
+                    provider = self.registry.get(next_name)
+                    self.event_bus.emit(
+                        EventType.PROVIDER_FALLBACK_USED,
+                        task_id=task_id,
+                        role=role,
+                        provider=provider.name,
+                        payload={
+                            "from_provider": prev_name,
+                            "to_provider": provider.name,
+                            "reason": "rate_limit",
+                        },
+                    )
+                    continue
+
+                # All candidates are in cooldown/quota-capped -> hibernate until earliest availability
+                _, min_wait, all_candidates = self._select_available_provider_for_role(role)
+                resume_dt = datetime.now(UTC) + timedelta(seconds=max(1, min_wait))
+                self._hibernate_until(
+                    resume_dt=resume_dt,
+                    providers=all_candidates,
                     task_id=task_id,
                     role=role,
                 )
                 if self._abort_requested:
                     raise _AbortedByControlError()
+                avail_name, _, _ = self._select_available_provider_for_role(role)
+                provider = self.registry.get(avail_name)
                 continue
+
+            # Poll proxy monitor after non-zero / timed-out call to classify fatal error vs route switch
+            post_proxy: ProxyHealthStatus | None = None
+            if response.exit_code != 0 or response.timed_out or response.idle_timed_out:
+                post_proxy = self._poll_proxy_monitor_for_provider(
+                    provider,
+                    task_id=task_id,
+                    role=role,
+                )
+                if post_proxy is not None and post_proxy.requires_manual_action:
+                    raise _PausedByInfraError(
+                        reason=(
+                            post_proxy.fatal_reason
+                            or post_proxy.last_message
+                            or f"Proxy monitor error ({post_proxy.state})"
+                        ),
+                        pause_reason="proxy_error",
+                        task_id=task_id,
+                        role=role,
+                        provider=provider.name,
+                    )
+
+            # Free transport retry classification (before response, no git changes, fast failure)
+            proxy_switching = bool(post_proxy and post_proxy.route_switching)
+            transport_fail = (not tamper_changes) and is_transport_failure_before_response(
+                response,
+                max_duration_seconds=self.config.workflow.transport_failure_max_duration_seconds,
+                git_tree_changed=git_tree_changed,
+                proxy_route_switching=proxy_switching,
+            )
+
+            if transport_fail and max_transport_retries > 0:
+                # Honor abort / pause_after_current BEFORE launching a transport retry
+                self._check_control_after_step()
+                if transport_retries < max_transport_retries:
+                    base_delay = (
+                        float(
+                            transport_delays[min(transport_retries, len(transport_delays) - 1)]
+                        )
+                        if transport_delays
+                        else 0.0
+                    )
+                    delay = round(self._jitter(base_delay), 2)
+                    transport_retries += 1
+                    reason_snippet = (response.raw_stderr or response.raw_stdout).strip()[:200] or (
+                        f"exit_code={response.exit_code}"
+                    )
+                    self.event_bus.emit(
+                        EventType.PROVIDER_TRANSPORT_RETRY,
+                        task_id=task_id,
+                        role=role,
+                        provider=provider.name,
+                        payload={
+                            "attempt": transport_retries,
+                            "max_attempts": max_transport_retries,
+                            "reason": reason_snippet,
+                            "delay_seconds": delay,
+                            "exit_code": response.exit_code,
+                            "proxy_route_switching": proxy_switching,
+                        },
+                    )
+                    self._wait_backoff(
+                        delay_seconds=delay,
+                        provider_name=provider.name,
+                        task_id=task_id,
+                        role=role,
+                        phase_prefix="transport_backoff",
+                    )
+                    continue
+
+                # Exhausted free transport retries without ever getting a model response -> pause
+                # without burning QuotaTracker, task.attempts, or review_rounds.
+                raise _PausedByInfraError(
+                    reason=(
+                        f"{role.value} provider '{provider.name}' failed before response after "
+                        f"{max_transport_retries} transport retries (exit_code={response.exit_code})"
+                    ),
+                    task_id=task_id,
+                    role=role,
+                    provider=provider.name,
+                )
+
+            # Record quota usage ONLY for non-transport calls (actual responses / work done)
+            self.event_bus.quota_tracker.record_request(provider.name)
+            self.event_bus.save_state()
 
             failure_kind = classify_provider_failure(response)
 
@@ -981,6 +1513,7 @@ class OrchestratorRunner:
                     and not tamper_changes
                     and readonly_timeout_retries < self.config.workflow.retry_on_timeout_readonly
                 ):
+                    self._check_control_after_step()
                     if self.git_ops.restore_soft_to_base(expected_head):
                         self.event_bus.emit(
                             EventType.AGENT_COMMIT_SOFT_RESET,
@@ -1003,7 +1536,7 @@ class OrchestratorRunner:
                         payload={
                             "attempt": readonly_timeout_retries,
                             "max_attempts": self.config.workflow.retry_on_timeout_readonly,
-                            "reason": "readonly_timeout",
+                            "reason": "idle_timeout" if response.idle_timed_out else "readonly_timeout",
                             "delay_seconds": delay,
                         },
                     )
@@ -1014,7 +1547,7 @@ class OrchestratorRunner:
                         role=role,
                     )
                     continue
-                # Writing roles on timeout do NOT blindly loop; soft-reset runs below and returns upward
+                # Writing roles on timeout / idle timeout NEVER blindly loop; return upward
                 break
 
             if failure_kind == "permanent":
@@ -1026,6 +1559,17 @@ class OrchestratorRunner:
                 and not tamper_changes
                 and transient_attempt < len(retry_delays)
             ):
+                # Guard against 19-minute blind retry hangs on writing roles:
+                # if a writing role ran longer than transport_failure_max_duration_seconds OR already
+                # modified repository files, do NOT blindly retry here — hand control back upward.
+                if role in WRITING_ROLES and (
+                    response.duration_seconds
+                    >= self.config.workflow.transport_failure_max_duration_seconds
+                    or git_tree_changed
+                ):
+                    break
+
+                self._check_control_after_step()
                 if self.git_ops.restore_soft_to_base(expected_head):
                     self.event_bus.emit(
                         EventType.AGENT_COMMIT_SOFT_RESET,
@@ -1125,7 +1669,7 @@ class OrchestratorRunner:
             guard_report=guard_report,
         )
 
-        if response.exit_code == 0 and not response.timed_out:
+        if response.exit_code == 0 and not response.timed_out and not response.idle_timed_out:
             self.event_bus.emit(
                 EventType.PROVIDER_SUCCEEDED,
                 task_id=task_id,
@@ -1145,6 +1689,7 @@ class OrchestratorRunner:
                 payload={
                     "exit_code": response.exit_code,
                     "timed_out": response.timed_out,
+                    "idle_timed_out": response.idle_timed_out,
                     "stderr_tail": response.raw_stderr[-400:],
                 },
             )
@@ -1174,6 +1719,7 @@ class OrchestratorRunner:
             "provider": response.provider_name,
             "exit_code": response.exit_code,
             "timed_out": response.timed_out,
+            "idle_timed_out": response.idle_timed_out,
             "duration_seconds": response.duration_seconds,
             "parsed_text": response.parsed_text,
             "guard_passed": guard_report.passed,
@@ -1182,6 +1728,10 @@ class OrchestratorRunner:
             "violations": [
                 {"code": v.code, "path": v.path, "line": v.line, "message": v.message}
                 for v in guard_report.all_violations
+            ],
+            "soft_limit_warnings": [
+                {"code": v.code, "path": v.path, "line": v.line, "message": v.message}
+                for v in guard_report.soft_limit_warnings
             ],
         }
         if role not in READ_ONLY_ROLES:
@@ -1260,16 +1810,13 @@ class OrchestratorRunner:
         max_gate_retries = self.config.workflow.max_gate_retries_per_round
 
         while task.review_rounds < max_rounds:
-            self._process_control_commands()
-            if self._abort_requested:
-                raise _AbortedByControlError()
+            self._check_control_after_step()
 
             gates_passed_this_round = False
             last_guard_report: DiffGuardReport | None = None
             last_worker_parsed: ParsedWorkerOutput | None = None
 
             for _gate_try in range(max_gate_retries):
-                task = self.store.update_task_fields(task.id, attempts=task.attempts + 1)
                 _, attempt_dir = self._next_attempt_dir(task.id)
 
                 progress_text = self._read_progress_text()
@@ -1299,10 +1846,11 @@ class OrchestratorRunner:
                     task_complexity=task.complexity,
                     allowed_paths=task.allowed_paths,
                 )
-                # Honor `control abort` immediately after a provider call completes (before gates/retries/reviews)
-                self._process_control_commands()
-                if self._abort_requested:
-                    raise _AbortedByControlError()
+                task = self.store.update_task_fields(task.id, attempts=task.attempts + 1)
+
+                # Honor `control abort` AND `pause_after_current` immediately after a provider step
+                # (before running gates, next retries, or reviews)
+                self._check_control_after_step()
 
                 last_guard_report = guard_report
                 parsed = parse_worker_output(response.parsed_text)
@@ -1467,7 +2015,24 @@ class OrchestratorRunner:
                     payload={"yellow_files": last_guard_report.yellow_files},
                 )
 
-            # Route A: Easy task without Yellow Zone & without file overlap with existing batch -> BATCH_PENDING
+            soft_warning_note: str | None = None
+            if last_guard_report.has_soft_warnings:
+                soft_warning_note = last_guard_report.soft_warning_text()
+                self.event_bus.emit(
+                    EventType.DIFF_GUARD_SOFT_WARNING,
+                    task_id=task.id,
+                    role=worker_role,
+                    payload={
+                        "details": [w.message for w in last_guard_report.soft_limit_warnings],
+                        "codes": [w.code for w in last_guard_report.soft_limit_warnings],
+                        "prod_files_count": last_guard_report.prod_files_count,
+                        "prod_changed_lines": last_guard_report.prod_changed_lines,
+                        "test_files_count": last_guard_report.test_files_count,
+                        "test_changed_lines": last_guard_report.test_changed_lines,
+                    },
+                )
+
+            # Route A: Easy task without Yellow Zone, without soft warnings & without file overlap -> BATCH_PENDING
             existing_batch_files = {
                 fp for bt in self._get_batch_pending_tasks() for fp in bt.changed_files
             }
@@ -1476,6 +2041,7 @@ class OrchestratorRunner:
             if (
                 task.complexity == TaskComplexity.EASY
                 and not last_guard_report.touched_yellow_zone
+                and not last_guard_report.has_soft_warnings
                 and not overlaps_batch
                 and self.config.workflow.batch_review_size > 1
             ):
@@ -1505,7 +2071,7 @@ class OrchestratorRunner:
                 self._sync_batch_queue_from_store()
                 return
 
-            # Route B: Medium, Hard, or Yellow-Zone-triggered Easy -> Individual review
+            # Route B: Medium, Hard, Yellow-Zone-triggered, or Soft-Warning Easy -> Individual review
             task = self._transition_task(
                 task.id,
                 TaskStatus.NEEDS_REVIEW,
@@ -1523,10 +2089,9 @@ class OrchestratorRunner:
                     last_report=last_worker_parsed.report,
                     base_sha=task_base_sha,
                     repo_map_text=repo_map_text,
+                    soft_warning_note=soft_warning_note,
                 )
-                self._process_control_commands()
-                if self._abort_requested:
-                    raise _AbortedByControlError()
+                self._check_control_after_step()
                 if not pre_ok:
                     review_feedback = pre_feedback
                     self.store.add_comment(
@@ -1561,10 +2126,9 @@ class OrchestratorRunner:
                 last_report=last_worker_parsed.report,
                 base_sha=task_base_sha,
                 repo_map_text=repo_map_text,
+                soft_warning_note=soft_warning_note,
             )
-            self._process_control_commands()
-            if self._abort_requested:
-                raise _AbortedByControlError()
+            self._check_control_after_step()
 
             if master_ok:
                 final_sha: str | None = None
@@ -1636,6 +2200,7 @@ class OrchestratorRunner:
         last_report: str,
         base_sha: str,
         repo_map_text: str,
+        soft_warning_note: str | None = None,
     ) -> tuple[bool, str]:
         _, attempt_dir = self._next_attempt_dir(f"{task.id}_{role.value}")
         profile = self.registry.for_role(role).profile
@@ -1647,6 +2212,7 @@ class OrchestratorRunner:
             task=task,
             filtered_diff=filtered_diff,
             last_report=last_report,
+            extra_instructions=soft_warning_note,
         )
         response, guard_report = self._invoke_provider_guarded(
             role=role,

@@ -61,8 +61,6 @@ providers:
     args_template:
       - "--model"
       - "{model}"
-      - "--mode"
-      - "auto"
       - "--dangerously-skip-permissions"
       - "--disable-slash-commands"
       - "--input-format"
@@ -72,10 +70,17 @@ providers:
     model: "gemini-4-hydrogen-high"
     output_parser: "plain"
     timeout_seconds: 900
+    idle_timeout_seconds: 300
     anti_laziness: false
     rate_limit_cooldown_seconds: 900
     quota_window_seconds: 18000
     quota_max_requests: 80
+    # Optional fallback provider profiles tried automatically on 429 / quota ceiling:
+    fallback_providers: []
+    # Optional sequential account switching (e.g., via `aisw`):
+    # account_group: "agy"
+    # account_profile: "cheap"
+    # switch_command: ["aisw", "use", "antigravity", "cheap"]
 
   # Read-only pre-reviewer via Antigravity CLI (`--mode plan`, without `--disable-slash-commands`)
   provider_pre_reviewer_agy:
@@ -95,6 +100,7 @@ providers:
     model: "gemini-4-neon-medium"
     output_parser: "plain"
     timeout_seconds: 600
+    idle_timeout_seconds: 300
     anti_laziness: false
     rate_limit_cooldown_seconds: 900
     quota_window_seconds: 18000
@@ -159,6 +165,12 @@ roles:
   architect: "provider_master"          # Must have can_edit_files: true
   refactorer: "provider_master"         # Must have can_edit_files: true
 
+# Optional role-level fallback providers tried when primary profile hits 429 or quota_max_requests
+fallback_providers: {}
+# Example:
+#   worker_medium: ["provider_strong", "provider_master"]
+#   reviewer: ["provider_reviewer_api"]
+
 zones:
   red_protected:
     - ".pipeline/**"
@@ -186,12 +198,16 @@ zones:
   enforce_allowed_paths_on_yellow: false
 
 diff_guard:
+  # New test files matching zones.test_patterns do not count against production max_files/max_lines
+  # (Red Zone M/D/R, allowed_paths, and PlaceholderGuard still apply to tests).
+  exclude_tests_from_limits: true
+  hard_max_test_lines: 3000
   limits:
-    easy:   { max_files: 5,  max_lines: 200 }
-    medium: { max_files: 12, max_lines: 600 }
-    hard:   { max_files: 25, max_lines: 1500 }
-  architect_limit:  { max_files: 15, max_lines: 800 }
-  refactorer_limit: { max_files: 30, max_lines: 1800 }
+    easy:   { soft_max_files: 5,  soft_max_lines: 200,  hard_max_files: 8,  hard_max_lines: 400 }
+    medium: { soft_max_files: 12, soft_max_lines: 600,  hard_max_files: 20, hard_max_lines: 1400 }
+    hard:   { soft_max_files: 25, soft_max_lines: 1500, hard_max_files: 40, hard_max_lines: 2500 }
+  architect_limit:  { soft_max_files: 15, soft_max_lines: 800,  hard_max_files: 25, hard_max_lines: 1500 }
+  refactorer_limit: { soft_max_files: 30, soft_max_lines: 1800, hard_max_files: 45, hard_max_lines: 3000 }
   exclude_from_review:
     - "**/package-lock.json"
     - "**/pnpm-lock.yaml"
@@ -244,6 +260,9 @@ workflow:
   refactor_every_n_tasks: 6
   refactor_on_stage_complete: true
   cleanup_ports: []
+  max_transport_retries: 6
+  transport_retry_delays_seconds: [3, 5, 10, 20, 30]
+  transport_failure_max_duration_seconds: 120
   transient_retry_delays_seconds: [10, 30, 90]
   retry_on_timeout_readonly: 1
   auto_commit: true
@@ -256,6 +275,7 @@ notifications:
     bot_token_env: "TELEGRAM_BOT_TOKEN"
     chat_id_env: "TELEGRAM_CHAT_ID"
     timeout_seconds: 10
+    notify_on_provider_started: false
     events:
       - "run_started"
       - "task_done"
@@ -264,3 +284,26 @@ notifications:
       - "pause"
       - "run_finished"
       - "fatal_error"
+
+# Optional external proxy/gateway health monitor (disabled by default; fully declarative).
+# Machine-specific paths/ports/patterns can live in a gitignored `*.local.yaml` file.
+proxy_monitor:
+  enabled: false
+  # config_file: "proxy_monitor.local.yaml"
+  # apply_to_providers: ["provider_main"]
+  # proxy_host: "127.0.0.1"
+  # proxy_port: 8080
+  # tcp_timeout_seconds: 2.0
+  # status_json:
+  #   path: "${PROXY_STATE_DIR}/status.json"
+  #   route_field: "route"
+  #   last_ok_at_field: "last_ok.at"
+  #   disabled_field: "disabled"
+  #   blockers_field: "blockers"
+  #   transient_error_field: "last_error"
+  # log_probes:
+  #   - path: "${PROXY_STATE_DIR}/proxy.log"
+  #     tail_lines: 80
+  #     ok_patterns: ["upstream ok", "request succeeded"]
+  #     transient_patterns: ["upstream switched", "reconnecting"]
+  #     fatal_patterns: ["auth token expired", "license invalid", "blocked by firewall"]

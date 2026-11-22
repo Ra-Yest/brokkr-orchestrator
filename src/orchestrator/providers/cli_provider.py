@@ -15,9 +15,34 @@ from orchestrator.process_utils import resolve_executable, run_noninteractive_pr
 from orchestrator.providers.base import BaseAgentProvider, ProviderRequest, ProviderResponse
 
 _RETRY_AFTER_RE = re.compile(
-    r"(?:retry[\s_-]*after|try again in|wait)\s*[:=]?\s*(\d+)\s*(s|sec|seconds|m|min|minutes)?",
+    r"(?:retry[\s_-]*after|try again in|wait|resets?\s+in)\s*[:=]?\s*(\d+)\s*(s|sec|seconds|m|min|minutes|h|hr|hours)?",
     re.IGNORECASE,
 )
+
+_RESET_CLOCK_RE = re.compile(
+    r"(?:resets?\s+at|available\s+at|try\s+again\s+at)\s+(\d{1,2}):(\d{2})(?::(\d{2}))?\s*(UTC|Z)?",
+    re.IGNORECASE,
+)
+
+
+def _seconds_until_clock_reset(combined_output: str) -> int | None:
+    from datetime import UTC, datetime, timedelta
+
+    match = _RESET_CLOCK_RE.search(combined_output)
+    if not match:
+        return None
+    hour = int(match.group(1))
+    minute = int(match.group(2))
+    second = int(match.group(3) or 0)
+    if not (0 <= hour <= 23 and 0 <= minute <= 59 and 0 <= second <= 59):
+        return None
+    tz_tag = match.group(4)
+    now = datetime.now(UTC) if tz_tag else datetime.now().astimezone()
+    target = now.replace(hour=hour, minute=minute, second=second, microsecond=0)
+    if target <= now:
+        target += timedelta(days=1)
+    delta = int((target - now).total_seconds())
+    return max(1, delta)
 
 
 def _extract_json_path(obj: Any, dot_path: str) -> str:
@@ -54,8 +79,16 @@ class CliAgentProvider(BaseAgentProvider):
         if retry_match:
             amount = int(retry_match.group(1))
             unit = (retry_match.group(2) or "s").lower()
-            seconds = amount * 60 if unit.startswith("m") else amount
+            if unit.startswith("h"):
+                seconds = amount * 3600
+            elif unit.startswith("m"):
+                seconds = amount * 60
+            else:
+                seconds = amount
             return True, max(1, seconds)
+        clock_wait = _seconds_until_clock_reset(combined_output)
+        if clock_wait is not None:
+            return True, clock_wait
         return True, self.profile.rate_limit_cooldown_seconds
 
     def _parse_output(self, raw_text: str) -> str:
@@ -144,6 +177,11 @@ class CliAgentProvider(BaseAgentProvider):
         self._validate_resolved_executable(resolved_base_cmd[0])
 
         timeout_sec = min(request.timeout_seconds, self.profile.timeout_seconds)
+        idle_timeout_sec = (
+            request.idle_timeout_seconds
+            if request.idle_timeout_seconds is not None
+            else self.profile.idle_timeout_seconds
+        )
 
         # Store temporary prompt/output files strictly outside the target repo and .pipeline/
         with tempfile.TemporaryDirectory(prefix="orch_cli_") as tmp_dir_str:
@@ -172,6 +210,9 @@ class CliAgentProvider(BaseAgentProvider):
                 env=resolved_env,
                 stdin_data=stdin_data,
                 timeout_seconds=timeout_sec,
+                idle_timeout_seconds=idle_timeout_sec,
+                on_first_output=request.on_first_output,
+                workspace_watch_dir=request.workdir,
             )
 
             file_output = ""
@@ -191,6 +232,8 @@ class CliAgentProvider(BaseAgentProvider):
             parsed_text=parsed_text,
             duration_seconds=proc_res.duration_seconds,
             timed_out=proc_res.timed_out,
+            idle_timed_out=proc_res.idle_timed_out,
+            received_meaningful_output=proc_res.received_meaningful_output or bool(file_output.strip()),
             rate_limited=rate_limited,
             retry_after_seconds=retry_after,
             metadata={
@@ -198,6 +241,7 @@ class CliAgentProvider(BaseAgentProvider):
                 "command": self.profile.command[0],
                 "prompt_mode": self.profile.prompt_mode,
                 "used_output_file": bool(file_output.strip()),
+                "idle_timed_out": proc_res.idle_timed_out,
             },
         )
 

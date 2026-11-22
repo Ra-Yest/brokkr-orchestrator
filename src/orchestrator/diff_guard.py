@@ -36,6 +36,11 @@ class DiffGuardReport:
     scope_violations: list[GuardViolation] = field(default_factory=list)
     limit_violations: list[GuardViolation] = field(default_factory=list)
     placeholder_violations: list[GuardViolation] = field(default_factory=list)
+    soft_limit_warnings: list[GuardViolation] = field(default_factory=list)
+    prod_files_count: int = 0
+    prod_changed_lines: int = 0
+    test_files_count: int = 0
+    test_changed_lines: int = 0
     filtered_diff: str = ""
 
     @property
@@ -47,6 +52,10 @@ class DiffGuardReport:
             *self.placeholder_violations,
         ]
 
+    @property
+    def has_soft_warnings(self) -> bool:
+        return bool(self.soft_limit_warnings)
+
     def summary_text(self) -> str:
         lines: list[str] = []
         for violation in self.all_violations:
@@ -54,6 +63,19 @@ class DiffGuardReport:
                 violation.path or "<repo>"
             )
             lines.append(f"[{violation.code}] {loc}: {violation.message}")
+        return "\n".join(lines)
+
+    def soft_warning_text(self) -> str:
+        if not self.soft_limit_warnings:
+            return ""
+        lines = [
+            "DIFF_GUARD_SOFT_WARNING: Production diff exceeded soft threshold(s) "
+            f"(prod_files={self.prod_files_count}, prod_lines={self.prod_changed_lines}, "
+            f"test_files={self.test_files_count}, test_lines={self.test_changed_lines}). "
+            "Review carefully for scope creep, unintended side effects, or maintainability issues:",
+        ]
+        for warning in self.soft_limit_warnings:
+            lines.append(f"- [{warning.code}] {warning.message}")
         return "\n".join(lines)
 
 
@@ -465,34 +487,117 @@ def evaluate_diff(
                 )
             )
 
-    # 3. Diff Guard file & line limits (excluding exclude_from_review artifacts/generated files)
+    # 3. Diff Guard file & line limits (excluding exclude_from_review artifacts/generated files;
+    #    optionally excluding test_patterns from production limits with a dedicated test-line ceiling)
     limit = _resolve_diff_limit(role, config, task_complexity)
-    countable_files = [
-        f for f in changed_files if not matches_any_glob(f, config.diff_guard.exclude_from_review)
+    dg_cfg = config.diff_guard
+    hard_max_files = limit.hard_max_files or 1
+    hard_max_lines = limit.hard_max_lines or 1
+
+    countable_all_files = [
+        f for f in changed_files if not matches_any_glob(f, dg_cfg.exclude_from_review)
     ]
-    total_changed_lines = added_lines + deleted_lines
-    if len(countable_files) > limit.max_files:
+    test_files = [f for f in countable_all_files if matches_any_glob(f, zones.test_patterns)]
+    prod_files = [f for f in countable_all_files if not matches_any_glob(f, zones.test_patterns)]
+
+    test_added = 0
+    test_deleted = 0
+    prod_added = 0
+    prod_deleted = 0
+    for path, section in _split_diff_sections(raw_diff):
+        if matches_any_glob(path, dg_cfg.exclude_from_review):
+            continue
+        if "GIT binary patch" in section or "\nBinary files " in section:
+            continue
+        sec_added = 0
+        sec_deleted = 0
+        for line in section.splitlines():
+            if line.startswith("+++") or line.startswith("---"):
+                continue
+            if line.startswith("+"):
+                sec_added += 1
+            elif line.startswith("-"):
+                sec_deleted += 1
+        if matches_any_glob(path, zones.test_patterns):
+            test_added += sec_added
+            test_deleted += sec_deleted
+        else:
+            prod_added += sec_added
+            prod_deleted += sec_deleted
+
+    test_changed_lines = test_added + test_deleted
+    if dg_cfg.exclude_tests_from_limits:
+        counted_files = prod_files
+        counted_added = prod_added
+        counted_deleted = prod_deleted
+    else:
+        counted_files = countable_all_files
+        counted_added = added_lines
+        counted_deleted = deleted_lines
+    counted_lines = counted_added + counted_deleted
+
+    soft_limit_warnings: list[GuardViolation] = []
+
+    if len(counted_files) > hard_max_files:
         limit_violations.append(
             GuardViolation(
                 code="DIFF_GUARD_MAX_FILES",
                 path=None,
                 line=None,
                 message=(
-                    f"Changed {len(countable_files)} countable files "
-                    f"({len(changed_files)} total), exceeding Diff Guard limit "
-                    f"of {limit.max_files} files for {role.value}"
+                    f"Changed {len(counted_files)} countable files "
+                    f"({len(changed_files)} total, {len(test_files)} test files), "
+                    f"exceeding Diff Guard hard limit of {hard_max_files} files for {role.value}"
                 ),
             )
         )
-    if total_changed_lines > limit.max_lines:
+    elif limit.soft_max_files is not None and len(counted_files) > limit.soft_max_files:
+        soft_limit_warnings.append(
+            GuardViolation(
+                code="DIFF_GUARD_SOFT_MAX_FILES",
+                path=None,
+                line=None,
+                message=(
+                    f"Changed {len(counted_files)} production files "
+                    f"(soft={limit.soft_max_files}, hard={hard_max_files}) for {role.value}"
+                ),
+            )
+        )
+
+    if counted_lines > hard_max_lines:
         limit_violations.append(
             GuardViolation(
                 code="DIFF_GUARD_MAX_LINES",
                 path=None,
                 line=None,
                 message=(
-                    f"Changed {total_changed_lines} lines (+{added_lines}/-{deleted_lines}), "
-                    f"exceeding Diff Guard limit of {limit.max_lines} lines for {role.value}"
+                    f"Changed {counted_lines} lines (+{counted_added}/-{counted_deleted}), "
+                    f"exceeding Diff Guard hard limit of {hard_max_lines} lines for {role.value}"
+                ),
+            )
+        )
+    elif limit.soft_max_lines is not None and counted_lines > limit.soft_max_lines:
+        soft_limit_warnings.append(
+            GuardViolation(
+                code="DIFF_GUARD_SOFT_MAX_LINES",
+                path=None,
+                line=None,
+                message=(
+                    f"Changed {counted_lines} production lines (+{counted_added}/-{counted_deleted}, "
+                    f"soft={limit.soft_max_lines}, hard={hard_max_lines}) for {role.value}"
+                ),
+            )
+        )
+
+    if dg_cfg.exclude_tests_from_limits and test_changed_lines > dg_cfg.hard_max_test_lines:
+        limit_violations.append(
+            GuardViolation(
+                code="DIFF_GUARD_MAX_TEST_LINES",
+                path=None,
+                line=None,
+                message=(
+                    f"Changed {test_changed_lines} test lines (+{test_added}/-{test_deleted}), "
+                    f"exceeding Diff Guard hard_max_test_lines ceiling of {dg_cfg.hard_max_test_lines}"
                 ),
             )
         )
@@ -524,5 +629,10 @@ def evaluate_diff(
         scope_violations=scope_violations,
         limit_violations=limit_violations,
         placeholder_violations=placeholder_violations,
+        soft_limit_warnings=soft_limit_warnings,
+        prod_files_count=len(prod_files),
+        prod_changed_lines=prod_added + prod_deleted,
+        test_files_count=len(test_files),
+        test_changed_lines=test_changed_lines,
         filtered_diff=filtered_diff,
     )

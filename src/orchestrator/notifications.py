@@ -53,7 +53,18 @@ class TelegramNotifier(BaseNotifier):
         self.config = config
 
     def should_notify(self, event: str) -> bool:
-        return self.config.enabled and event in self.config.events
+        if not self.config.enabled:
+            return False
+        if event == "provider_started":
+            return self.config.notify_on_provider_started or ("provider_started" in self.config.events)
+        if event == "provider_recovered":
+            # Always notify on recovery after transport retries when Telegram is enabled
+            return True
+        if event in ("hibernation", "proxy"):
+            return (event in self.config.events) or ("pause" in self.config.events)
+        if event == "account_switch_failed":
+            return (event in self.config.events) or ("fatal_error" in self.config.events)
+        return event in self.config.events
 
     def send(self, title: str, message: str) -> bool:
         if not self.config.enabled:

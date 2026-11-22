@@ -87,12 +87,17 @@ Edit `<target-repo>/AGENTS.md`. Remember that `AGENTS.md` is placed in **Layer 1
 
 - Every profile declares `can_edit_files: bool` (defaults to `true` for `kind: "cli"`, `false` for `kind: "api"`).
 - Writing roles (`worker_easy`, `worker_medium`, `worker_hard`, `architect`, `refactorer`) **must** use a provider with `can_edit_files: true`.
-- Read-only roles (`planner`, `pre_reviewer`, `reviewer`) may use either a CLI provider (e.g., `agy` with `can_edit_files: false` and `--mode plan`, without `--disable-slash-commands`) or an OpenAI-compatible `kind: "api"` provider.
+- Read-only roles (`planner`, `pre_reviewer`, `reviewer`) may use either a CLI provider (e.g., `agy` with `can_edit_files: false` and `--mode plan`, without `--disable-slash-commands`) or an OpenAI-compatible `kind: "api"` provider. Writing `agy` profiles omit `--mode auto` (which triggers stderr warnings on some accounts) and use `--dangerously-skip-permissions --disable-slash-commands`.
 - If a CLI profile's `args_template` uses `{model}`, the `model` field is required and validated on load / `doctor`.
 - Optional env vars use `${VAR:-}` syntax: if `OPENAI_API_KEY` is unset (e.g. `codex exec` authenticated via ChatGPT Plus OAuth), the orchestrator omits the key cleanly instead of failing.
 - Set `anti_laziness: true` on OpenAI / shortcut-prone profiles to automatically append `.agents/anti_laziness_openai.md` to their static prefix.
+- Set `idle_timeout_seconds` (e.g., `300`) on CLI profiles to automatically terminate hung processes that produce no `stdout`/`stderr` bytes and make no file modifications in the repository.
+- Configure `fallback_providers` (per role or per provider profile) to automatically switch to another compatible provider on `429` or `quota_max_requests`; when all candidates are exhausted, the runner enters `status: "hibernating"` with `resume_at` and wakes up automatically (or responds immediately to `control resume` / `control abort`).
+- Configure `account_group`, `account_profile`, and `switch_command` (e.g., `["aisw", "use", "antigravity", "pro"]`) for sequential multi-account switching tracked in `state.json` (`active_accounts`).
+- Optionally enable `proxy_monitor:` (inline or via an external gitignored `config_file: "proxy_monitor.local.yaml"`) to declaratively probe a local proxy/gateway TCP endpoint, JSON status file, and log files so transient upstream switches trigger free transport retries while fatal auth/service blockers pause cleanly (`pause_reason: "proxy_error"`).
+- Under `diff_guard:`, `exclude_tests_from_limits: true` excludes new test files (`zones.test_patterns`) from production `max_files`/`max_lines` (capped separately by `hard_max_test_lines: 3000`), and `soft_max_*` / `hard_max_*` limits route soft exceedances to individual review with `DIFF_GUARD_SOFT_WARNING` without rolling back.
 - Set `zones.enforce_allowed_paths_on_yellow: true` if you want workers to fail with `OUT_OF_ALLOWED_PATHS` (prompting `STATUS: NEEDS_ARCH_CHANGE` -> `architect`) when touching `yellow_shared` files not explicitly listed in `task.allowed_paths` (defaults to `false` for solo Master review).
-- Configure Telegram AFK notifications under `notifications.telegram` (by default sends 7 concise event categories without retry spam: `run_started`, `task_done` with consolidated batch summaries, `task_failed`, `escalation`, `pause`, `run_finished`, `fatal_error`; customize via `notifications.telegram.events`).
+- Configure Telegram AFK notifications under `notifications.telegram` (by default sends concise event categories without retry spam, plus mandatory recovery alerts after `transport_retries` and hibernation/proxy alerts; set `notify_on_provider_started: true` to also notify on every normal provider start).
 
 ### Example A: Python / FastAPI (`zones` & `gates`)
 
@@ -235,7 +240,7 @@ Write atomic, well-scoped tasks forming an acyclic DAG (`depends_on`):
 ## Step 6: Run Preflight Check & Launch
 
 ```bash
-# 1. Verify git state, .gitignore, schemas, templates, active providers, gate binaries, and Telegram env
+# 1. Verify git state, .gitignore, schemas, templates, active providers, switch_command, proxy_monitor, gate binaries (including repo-relative paths), and Telegram env
 orchestrator doctor --repo /path/to/my-repo
 
 # 2. Dry-run validation
@@ -261,13 +266,13 @@ orchestrator run --repo D:\my-repo | Tee-Object D:\my-repo\.pipeline\console.log
 While the pipeline runs in AFK mode (commands in `.pipeline/control_inbox/`, `.pipeline/INBOX.md`, `.pipeline/control.json`, and `.pipeline/console.log` are allowed during provider runs and never trigger Integrity Guard):
 
 ```bash
-# Check live status, active task/provider, batch queue, and 5-hour rolling quotas
+# Check live status, active task/provider, active_accounts, proxy_health_status, batch queue, and 5-hour rolling quotas
 orchestrator status --repo /path/to/my-repo
 
-# Gracefully pause after the current task finishes
+# Gracefully pause after the current provider step finishes (before next retry, gate, or review)
 orchestrator control pause --repo /path/to/my-repo --reason "Inspecting diff"
 
-# Resume a paused or rate-limited run
+# Resume a paused or hibernating run immediately
 orchestrator control resume --repo /path/to/my-repo
 
 # Retry a failed task (automatically unblocks eligible downstream tasks)

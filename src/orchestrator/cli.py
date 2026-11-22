@@ -20,6 +20,7 @@ from orchestrator.git_ops import GitOps
 from orchestrator.models import ControlAction, PipelineState, RunStatus, Task, TasksFile
 from orchestrator.prompt_builder import DEFAULT_ROLE_PROMPT_FILES
 from orchestrator.providers.base import ProviderRegistry
+from orchestrator.proxy_monitor import build_proxy_monitor
 from orchestrator.reporter import write_report
 from orchestrator.runner import OrchestratorRunner
 from orchestrator.stores.local_json import LocalJsonTaskStore
@@ -78,8 +79,6 @@ def _providers_and_roles_yaml(provider_preset: str) -> str:
     args_template:
       - "--model"
       - "{model}"
-      - "--mode"
-      - "auto"
       - "--dangerously-skip-permissions"
       - "--disable-slash-commands"
       - "--input-format"
@@ -88,6 +87,7 @@ def _providers_and_roles_yaml(provider_preset: str) -> str:
       - "text"
     model: "gemini-4-hydrogen-medium"
     timeout_seconds: 900
+    idle_timeout_seconds: 300
     anti_laziness: false
     rate_limit_cooldown_seconds: 900
     quota_window_seconds: 18000
@@ -100,8 +100,6 @@ def _providers_and_roles_yaml(provider_preset: str) -> str:
     args_template:
       - "--model"
       - "{model}"
-      - "--mode"
-      - "auto"
       - "--dangerously-skip-permissions"
       - "--disable-slash-commands"
       - "--input-format"
@@ -110,6 +108,7 @@ def _providers_and_roles_yaml(provider_preset: str) -> str:
       - "text"
     model: "gemini-4-hydrogen-high"
     timeout_seconds: 900
+    idle_timeout_seconds: 300
     anti_laziness: false
     rate_limit_cooldown_seconds: 900
     quota_window_seconds: 18000
@@ -122,8 +121,6 @@ def _providers_and_roles_yaml(provider_preset: str) -> str:
     args_template:
       - "--model"
       - "{model}"
-      - "--mode"
-      - "auto"
       - "--dangerously-skip-permissions"
       - "--disable-slash-commands"
       - "--input-format"
@@ -132,6 +129,7 @@ def _providers_and_roles_yaml(provider_preset: str) -> str:
       - "text"
     model: "gemini-4-neon-high"
     timeout_seconds: 900
+    idle_timeout_seconds: 300
     anti_laziness: false
     rate_limit_cooldown_seconds: 900
     quota_window_seconds: 18000
@@ -152,6 +150,7 @@ def _providers_and_roles_yaml(provider_preset: str) -> str:
       - "text"
     model: "gemini-4-neon-medium"
     timeout_seconds: 600
+    idle_timeout_seconds: 300
     anti_laziness: false
     rate_limit_cooldown_seconds: 900
     quota_window_seconds: 18000
@@ -172,6 +171,7 @@ def _providers_and_roles_yaml(provider_preset: str) -> str:
       - "text"
     model: "gemini-4-neon-xhigh"
     timeout_seconds: 900
+    idle_timeout_seconds: 300
     anti_laziness: false
     rate_limit_cooldown_seconds: 900
     quota_window_seconds: 18000
@@ -184,8 +184,6 @@ def _providers_and_roles_yaml(provider_preset: str) -> str:
     args_template:
       - "--model"
       - "{model}"
-      - "--mode"
-      - "auto"
       - "--dangerously-skip-permissions"
       - "--disable-slash-commands"
       - "--input-format"
@@ -194,6 +192,7 @@ def _providers_and_roles_yaml(provider_preset: str) -> str:
       - "text"
     model: "gemini-4-neon-xhigh"
     timeout_seconds: 900
+    idle_timeout_seconds: 300
     anti_laziness: false
     rate_limit_cooldown_seconds: 900
     quota_window_seconds: 18000
@@ -231,8 +230,6 @@ roles:
     args_template:
       - "--model"
       - "{model}"
-      - "--mode"
-      - "auto"
       - "--dangerously-skip-permissions"
       - "--disable-slash-commands"
       - "--input-format"
@@ -241,6 +238,7 @@ roles:
       - "text"
     model: "gemini-4-hydrogen-high"
     timeout_seconds: 900
+    idle_timeout_seconds: 300
     anti_laziness: false
     rate_limit_cooldown_seconds: 900
     quota_window_seconds: 18000
@@ -261,6 +259,7 @@ roles:
       - "text"
     model: "gemini-4-neon-medium"
     timeout_seconds: 600
+    idle_timeout_seconds: 300
     anti_laziness: false
     rate_limit_cooldown_seconds: 900
     quota_window_seconds: 18000
@@ -406,10 +405,12 @@ zones:
   enforce_allowed_paths_on_yellow: false
 
 diff_guard:
+  exclude_tests_from_limits: true
+  hard_max_test_lines: 3000
   limits:
-    easy:   {{ max_files: 5,  max_lines: 200 }}
-    medium: {{ max_files: 12, max_lines: 600 }}
-    hard:   {{ max_files: 25, max_lines: 1500 }}
+    easy:   {{ soft_max_files: 5,  soft_max_lines: 200,  hard_max_files: 8,  hard_max_lines: 400 }}
+    medium: {{ soft_max_files: 12, soft_max_lines: 600,  hard_max_files: 20, hard_max_lines: 1400 }}
+    hard:   {{ soft_max_files: 25, soft_max_lines: 1500, hard_max_files: 40, hard_max_lines: 2500 }}
 
 placeholder_guard:
   enabled: true
@@ -442,17 +443,28 @@ notifications:
 
 
 def _ensure_gitignore_has_pipeline(repo_root: Path, pipeline_dir_name: str = ".pipeline") -> bool:
-    """Append `.pipeline/` to `.gitignore` if not already ignored. Returns True if modified."""
+    """Append `.pipeline/` and `*.local.yaml` to `.gitignore` if not already ignored. Returns True if modified."""
     gitignore = repo_root / ".gitignore"
     entry = f"{pipeline_dir_name.strip('/')}/"
+    local_yaml_entry = "*.local.yaml"
     if gitignore.exists():
         lines = gitignore.read_text(encoding="utf-8", errors="replace").splitlines()
-        if any(ln.strip() in (entry, pipeline_dir_name.strip("/")) for ln in lines):
+        stripped = {ln.strip() for ln in lines}
+        to_add: list[str] = []
+        if entry not in stripped and pipeline_dir_name.strip("/") not in stripped:
+            to_add.append(entry)
+        if local_yaml_entry not in stripped:
+            to_add.append(local_yaml_entry)
+        if not to_add:
             return False
-        content = "\n".join(lines).rstrip() + f"\n\n# AFK Orchestrator runtime state\n{entry}\n"
+        addition = "\n".join(to_add)
+        content = "\n".join(lines).rstrip() + f"\n\n# AFK Orchestrator runtime state\n{addition}\n"
         atomic_write_text(gitignore, content)
         return True
-    atomic_write_text(gitignore, f"# AFK Orchestrator runtime state\n{entry}\n")
+    atomic_write_text(
+        gitignore,
+        f"# AFK Orchestrator runtime state\n{entry}\n{local_yaml_entry}\n",
+    )
     return True
 
 
@@ -558,6 +570,37 @@ def cmd_init(args: argparse.Namespace) -> int:
     return cmd_doctor(doctor_args)
 
 
+def _resolve_binary_in_repo_or_path(
+    exe: str,
+    repo_root: Path,
+    search_cwd: Path,
+    *,
+    lookup_path: str | None = None,
+) -> str | None:
+    """Resolve an executable via PATH or as a relative/absolute path inside repo_root/search_cwd."""
+    path_env = lookup_path if lookup_path is not None else os.environ.get("PATH")
+    resolved = shutil.which(exe, path=path_env)
+    if resolved is not None:
+        return resolved
+
+    candidates: list[Path] = []
+    exe_path = Path(exe)
+    if exe_path.is_absolute():
+        candidates.append(exe_path)
+    else:
+        candidates.append(search_cwd / exe_path)
+        if search_cwd.resolve() != repo_root.resolve():
+            candidates.append(repo_root / exe_path)
+
+    for candidate in candidates:
+        via_which = shutil.which(str(candidate))
+        if via_which is not None:
+            return via_which
+        if candidate.is_file():
+            return str(candidate)
+    return None
+
+
 def run_doctor_checks(repo_root: Path, config_path: Path) -> list[tuple[str, bool, str]]:
     """Run all preflight readiness checks. Returns list of (check_name, ok, detail)."""
     checks: list[tuple[str, bool, str]] = []
@@ -636,13 +679,36 @@ def run_doctor_checks(repo_root: Path, config_path: Path) -> list[tuple[str, boo
         except Exception as exc:
             checks.append(("tasks_json", False, str(exc)))
 
-        # Provider healthchecks only for active roles (plus warn for inactive profiles)
+        # Provider healthchecks for active roles and their configured fallbacks
         registry = ProviderRegistry.from_config(config)
         active_profiles = set(config.roles.as_dict().values())
+        for fb_list in config.fallback_providers.values():
+            active_profiles.update(fb_list)
+        for profile_name in list(active_profiles):
+            active_profiles.update(config.providers[profile_name].fallback_providers)
         for profile_name in sorted(active_profiles):
             provider = registry.get(profile_name)
             ok, msg = provider.healthcheck()
             checks.append((f"provider:{profile_name}", ok, msg))
+            if provider.profile.switch_command:
+                sw_exe = provider.profile.switch_command[0]
+                sw_resolved = _resolve_binary_in_repo_or_path(sw_exe, repo_root, repo_root)
+                checks.append(
+                    (
+                        f"account_switch:{profile_name}",
+                        sw_resolved is not None,
+                        f"Executable resolved: {sw_resolved}"
+                        if sw_resolved is not None
+                        else f"Account switch executable '{sw_exe}' not found in PATH or repo",
+                    )
+                )
+
+        # Optional external proxy monitor preflight check
+        if config.proxy_monitor.enabled:
+            monitor = build_proxy_monitor(config.proxy_monitor)
+            if monitor is not None:
+                pm_ok, pm_msg, _ = monitor.preflight()
+                checks.append(("proxy_monitor", pm_ok, pm_msg))
 
         # Quality gates preflight checks (executable availability, cwd, required env)
         for gate in config.gates:
@@ -650,11 +716,12 @@ def run_doctor_checks(repo_root: Path, config_path: Path) -> list[tuple[str, boo
             resolved_env, missing_env = resolve_env_map(gate.env, strict=False)
             lookup_path = resolved_env.get("PATH", os.environ.get("PATH"))
             exe = gate.command[0]
-            resolved_exe = shutil.which(exe, path=lookup_path)
-            if resolved_exe is None and ("/" in exe or "\\" in exe):
-                local_candidate = Path(exe) if Path(exe).is_absolute() else (gate_cwd / exe)
-                if local_candidate.is_file():
-                    resolved_exe = str(local_candidate)
+            resolved_exe = _resolve_binary_in_repo_or_path(
+                exe,
+                repo_root,
+                gate_cwd,
+                lookup_path=lookup_path,
+            )
 
             problems: list[str] = []
             if not gate_cwd.is_dir():
@@ -754,12 +821,25 @@ def cmd_status(args: argparse.Namespace) -> int:
     if state_path.exists():
         state = PipelineState.model_validate(json.loads(state_path.read_text(encoding="utf-8")))
         print(f"Run ID:   {state.run_id}")
-        print(f"Status:   {state.status.value} (paused={state.paused}, reason={state.pause_reason})")
+        resume_part = f", resume_at={state.resume_at}" if state.resume_at else ""
+        print(
+            f"Status:   {state.status.value} "
+            f"(paused={state.paused}, reason={state.pause_reason}{resume_part})"
+        )
         print(
             f"Active:   task={state.active_task_id} phase={state.active_phase} "
             f"role={state.active_role.value if state.active_role else None} "
             f"provider={state.active_provider}"
         )
+        if state.active_accounts:
+            accts = ", ".join(f"{k}={v}" for k, v in sorted(state.active_accounts.items()))
+            print(f"Accounts: {accts}")
+        if state.proxy_health_status is not None:
+            ps = state.proxy_health_status
+            print(
+                f"Proxy:    state={ps.state} healthy={ps.healthy} "
+                f"route={ps.active_route or '-'} msg={(ps.last_message or '-')[:100]}"
+            )
         print(f"Batch:    {state.batch_queue}")
         print("Provider rolling windows:")
         for pname, q in state.provider_quotas.items():

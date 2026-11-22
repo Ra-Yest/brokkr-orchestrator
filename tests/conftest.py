@@ -117,6 +117,9 @@ def make_test_config(
     refactor_every_n_tasks: int = 0,
     refactor_on_stage_complete: bool = False,
     transient_retry_delays_seconds: list[int] | None = None,
+    max_transport_retries: int = 6,
+    transport_retry_delays_seconds: list[int] | None = None,
+    transport_failure_max_duration_seconds: int = 120,
     retry_on_timeout_readonly: int = 1,
 ) -> PipelineConfig:
     cli_edit_profile = ProviderProfileConfig(
@@ -180,6 +183,13 @@ def make_test_config(
             batch_review_size=batch_review_size,
             refactor_every_n_tasks=refactor_every_n_tasks,
             refactor_on_stage_complete=refactor_on_stage_complete,
+            max_transport_retries=max_transport_retries,
+            transport_retry_delays_seconds=(
+                [3, 5, 10, 20, 30]
+                if transport_retry_delays_seconds is None
+                else transport_retry_delays_seconds
+            ),
+            transport_failure_max_duration_seconds=transport_failure_max_duration_seconds,
             transient_retry_delays_seconds=(
                 [10, 30, 90]
                 if transient_retry_delays_seconds is None

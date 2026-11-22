@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "afk-orchestrator"
-version = "0.1.0"
+version = "0.2.0"
 description = "Modular, fault-tolerant local AFK AI development pipeline orchestrator"
 requires-python = ">=3.11"
 dependencies = [

@@ -8,10 +8,4 @@ dist/
 build/
 *.egg-info/
 .pipeline/
-.venv/
-__pycache__/
-*.pyc
-*.egg-info/
-.pytest_cache/
-dist/
-build/
+*.local.yaml

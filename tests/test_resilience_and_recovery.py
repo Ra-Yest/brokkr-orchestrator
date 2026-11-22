@@ -107,7 +107,11 @@ def test_transient_retry_on_reviewer_and_batch_reviewer_succeeds_without_reject_
         ),
     ]
     tasks_path = write_tasks_file(temp_git_repo, tasks)
-    cfg = make_test_config(batch_review_size=2, transient_retry_delays_seconds=[10, 30, 90])
+    cfg = make_test_config(
+        batch_review_size=2,
+        max_transport_retries=0,
+        transient_retry_delays_seconds=[10, 30, 90],
+    )
     store = LocalJsonTaskStore(tasks_path)
 
     worker_medium_calls = {"count": 0}
@@ -200,7 +204,11 @@ def test_batch_reviewer_exhausting_retries_keeps_batch_pending_without_git_rever
         ),
     ]
     tasks_path = write_tasks_file(temp_git_repo, tasks)
-    cfg = make_test_config(batch_review_size=2, transient_retry_delays_seconds=[2, 4])
+    cfg = make_test_config(
+        batch_review_size=2,
+        max_transport_retries=0,
+        transient_retry_delays_seconds=[2, 4],
+    )
     store = LocalJsonTaskStore(tasks_path)
     reviewer_calls = {"count": 0}
     slept: list[float] = []

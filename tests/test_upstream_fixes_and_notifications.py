@@ -435,7 +435,7 @@ def test_example_yaml_and_init_agy_only_preset_have_valid_agy_flags(tmp_path: Pa
     main_prof = example_cfg.providers["provider_main"]
     assert main_prof.command == ["agy"]
     assert main_prof.prompt_mode == "stdin"
-    assert "--mode" in main_prof.args_template and "auto" in main_prof.args_template
+    assert "--mode" not in main_prof.args_template and "auto" not in main_prof.args_template
     assert "--dangerously-skip-permissions" in main_prof.args_template
     assert "--disable-slash-commands" in main_prof.args_template
     assert "--input-format" in main_prof.args_template
@@ -474,7 +474,7 @@ def test_example_yaml_and_init_agy_only_preset_have_valid_agy_flags(tmp_path: Pa
         assert "plan" in prof.args_template
         assert "--disable-slash-commands" not in prof.args_template
 
-    # Writing roles use `--mode auto --dangerously-skip-permissions`
+    # Writing roles omit `--mode auto` (avoids stderr warnings on some accounts) and use `--dangerously-skip-permissions`
     for w_role in (
         cfg.roles.worker_easy,
         cfg.roles.worker_medium,
@@ -484,7 +484,8 @@ def test_example_yaml_and_init_agy_only_preset_have_valid_agy_flags(tmp_path: Pa
     ):
         prof = cfg.providers[w_role]
         assert prof.can_edit_files is True
-        assert "auto" in prof.args_template
+        assert "--mode" not in prof.args_template
+        assert "auto" not in prof.args_template
         assert "--dangerously-skip-permissions" in prof.args_template
 
 

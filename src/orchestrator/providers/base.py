@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from orchestrator.config import PipelineConfig, ProviderProfileConfig
 from orchestrator.models import AgentRole
@@ -14,6 +15,8 @@ from orchestrator.models import AgentRole
 
 class ProviderRequest(BaseModel):
     """Normalized invocation request passed to any BaseAgentProvider implementation."""
+
+    model_config = ConfigDict(arbitrary_types_allowed=True)
 
     run_id: str
     task_id: str | None = None
@@ -24,8 +27,10 @@ class ProviderRequest(BaseModel):
     static_prefix_sha256: str = ""
     workdir: Path
     timeout_seconds: int = Field(default=900, ge=1)
+    idle_timeout_seconds: int | None = Field(default=None, ge=1)
     attempt_dir: Path
     extra_env: dict[str, str] = Field(default_factory=dict)
+    on_first_output: Callable[[str], None] | None = Field(default=None, exclude=True)
 
 
 class ProviderResponse(BaseModel):
@@ -38,6 +43,8 @@ class ProviderResponse(BaseModel):
     parsed_text: str = ""
     duration_seconds: float = 0.0
     timed_out: bool = False
+    idle_timed_out: bool = False
+    received_meaningful_output: bool = False
     rate_limited: bool = False
     retry_after_seconds: int | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
