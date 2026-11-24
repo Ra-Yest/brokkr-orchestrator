@@ -223,6 +223,10 @@ diff_guard:
     - "web/build/**"
     - "**/build/outputs/**"
     - "**/*.generated.*"
+  # Service artifacts (e.g., background LSP files like go.work.sum) ignored & cleaned for read-only roles
+  readonly_ignore_paths:
+    - "go.work.sum"
+    - "**/go.work.sum"
 
 placeholder_guard:
   enabled: true
@@ -253,6 +257,7 @@ gates:
   #   optional: false
 
 workflow:
+  max_attempts: 6
   max_review_rounds: 3
   max_gate_retries_per_round: 3
   hard_split_after_rounds: 2

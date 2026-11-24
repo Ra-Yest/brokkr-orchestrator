@@ -373,6 +373,11 @@ DEFAULT_DIFF_EXCLUDES: list[str] = [
     "**/*.min.css",
 ]
 
+DEFAULT_READONLY_IGNORE_PATHS: list[str] = [
+    "go.work.sum",
+    "**/go.work.sum",
+]
+
 
 class DiffGuardConfig(BaseModel):
     exclude_tests_from_limits: bool = True
@@ -416,6 +421,9 @@ class DiffGuardConfig(BaseModel):
         )
     )
     exclude_from_review: list[str] = Field(default_factory=lambda: list(DEFAULT_DIFF_EXCLUDES))
+    readonly_ignore_paths: list[str] = Field(
+        default_factory=lambda: list(DEFAULT_READONLY_IGNORE_PATHS)
+    )
 
 
 class PlaceholderGuardConfig(BaseModel):
@@ -435,6 +443,7 @@ class GateConfig(BaseModel):
 
 
 class WorkflowConfig(BaseModel):
+    max_attempts: int = Field(default=6, ge=1)
     max_review_rounds: int = Field(default=3, ge=1)
     max_gate_retries_per_round: int = Field(default=3, ge=1)
     hard_split_after_rounds: int = Field(default=2, ge=1)

@@ -204,6 +204,28 @@ class GitOps:
             ]
         )
 
+    def discard_paths(self, base_sha: str, paths: list[str]) -> list[str]:
+        """Revert/delete ONLY the specified relative paths back to base_sha without touching other edits."""
+        discarded: list[str] = []
+        seen: set[str] = set()
+        for raw_path in paths:
+            norm = raw_path.replace("\\", "/").lstrip("./")
+            if not norm or norm in seen or self._is_in_pipeline_dir(norm):
+                continue
+            seen.add(norm)
+            exists_in_base = (
+                self._run(["cat-file", "-e", f"{base_sha}:{norm}"], check=False).exit_code == 0
+            )
+            if exists_in_base:
+                self._run(["checkout", base_sha, "--", norm], check=False)
+            else:
+                self._run(["reset", "HEAD", "--", norm], check=False)
+                target_file = self.repo_root / norm
+                if target_file.is_file() or target_file.is_symlink():
+                    target_file.unlink(missing_ok=True)
+            discarded.append(norm)
+        return discarded
+
     def is_pipeline_dir_ignored(self) -> bool:
         res = self._run(["check-ignore", "-q", self.pipeline_dir], check=False)
         return res.exit_code == 0

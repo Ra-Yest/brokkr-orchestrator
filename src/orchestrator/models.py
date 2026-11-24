@@ -75,8 +75,10 @@ class Task(BaseModel):
     acceptance_criteria: list[str] = Field(default_factory=list)
     stage: str = "default"
     # Runtime tracking fields
+    max_attempts: int | None = Field(default=None, ge=1)
     attempts: int = 0
     review_rounds: int = 0
+    pre_review_approved: bool = False
     parent_task_id: str | None = None
     subtask_ids: list[str] = Field(default_factory=list)
     resolution: Literal["completed", "split", "skipped"] | None = None

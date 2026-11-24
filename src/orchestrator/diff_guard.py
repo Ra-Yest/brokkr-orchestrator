@@ -358,10 +358,22 @@ def evaluate_diff(
     placeholder_violations: list[GuardViolation] = []
     yellow_files: list[str] = []
 
-    # 1. Read-only roles: zero repository modifications permitted.
+    # 1. Read-only roles: zero repository modifications permitted (except readonly_ignore_paths).
     if role in READ_ONLY_ROLES:
-        if changes or raw_diff.strip():
-            for change in changes:
+        ro_ignores = config.diff_guard.readonly_ignore_paths
+        effective_changes = [
+            change
+            for change in changes
+            if not matches_any_glob(change.path, ro_ignores)
+        ]
+        effective_diff_sections = [
+            (p, sec)
+            for p, sec in _split_diff_sections(raw_diff)
+            if not matches_any_glob(p, ro_ignores)
+        ]
+        effective_raw_diff = "".join(sec for _, sec in effective_diff_sections)
+        if effective_changes or effective_raw_diff.strip():
+            for change in effective_changes:
                 red_violations.append(
                     GuardViolation(
                         code="READ_ONLY_ROLE_MODIFIED_FILES",
@@ -385,7 +397,7 @@ def evaluate_diff(
         return DiffGuardReport(
             passed=len(red_violations) == 0,
             role=role,
-            changed_files=changed_files,
+            changed_files=sorted({_normalize_rel_path(c.path) for c in effective_changes}),
             added_lines=added_lines,
             deleted_lines=deleted_lines,
             touched_yellow_zone=False,

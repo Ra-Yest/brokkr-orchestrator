@@ -30,9 +30,35 @@ _SECRET_KV_RE = re.compile(
 )
 
 
+_MOJIBAKE_CP1251_RE = re.compile(
+    r"(?:\u0420[\u0400-\u04ff\u0080-\u00bf\u2010-\u203f\u2116\u00a0-\u00ff]|"
+    r"\u0421[\u0400-\u04ff\u0080-\u00bf\u2010-\u203f\u2116\u00a0-\u00ff]){2,}"
+)
+
+
+def _decode_bytes_utf8_or_cp1251(data: bytes) -> str:
+    """Decode bytes strictly as UTF-8 (handling optional BOM), falling back to cp1251 on UnicodeDecodeError."""
+    try:
+        return data.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        return data.decode("cp1251", errors="replace")
+
+
+def normalize_proxy_text(text: str) -> str:
+    """Repair classic UTF-8-decoded-as-cp1251 mojibake while leaving valid UTF-8 untouched."""
+    if not text or not _MOJIBAKE_CP1251_RE.search(text):
+        return text
+    try:
+        repaired = text.encode("cp1251").decode("utf-8")
+    except (UnicodeEncodeError, UnicodeDecodeError):
+        return text
+    return repaired
+
+
 def sanitize_proxy_text(text: str) -> str:
-    """Redact potential credentials/tokens before persisting messages in events or state.json."""
-    redacted = _CREDENTIAL_URI_RE.sub(r"\1:***@", text)
+    """Normalize encoding and redact potential credentials/tokens before persisting messages."""
+    normalized = normalize_proxy_text(text)
+    redacted = _CREDENTIAL_URI_RE.sub(r"\1:***@", normalized)
     redacted = _BEARER_TOKEN_RE.sub(r"\1***", redacted)
     redacted = _SECRET_KV_RE.sub(r"\1***", redacted)
     return redacted
@@ -157,7 +183,8 @@ class GenericProxyMonitor(BaseProxyMonitor):
         if not target_path.is_file():
             return None
         try:
-            raw = json.loads(target_path.read_text(encoding="utf-8", errors="replace"))
+            decoded = _decode_bytes_utf8_or_cp1251(target_path.read_bytes())
+            raw = json.loads(decoded)
             return raw if isinstance(raw, dict) else None
         except Exception:
             return None
@@ -174,8 +201,15 @@ class GenericProxyMonitor(BaseProxyMonitor):
                 fh.seek(0, os.SEEK_END)
                 size = fh.tell()
                 read_bytes = min(size, max(32768, probe.tail_lines * 512))
-                fh.seek(max(0, size - read_bytes))
-                chunk = fh.read().decode("utf-8", errors="replace")
+                offset = max(0, size - read_bytes)
+                fh.seek(offset)
+                raw_chunk = fh.read()
+            if offset > 0:
+                # Skip a potentially partial leading line so UTF-8 multibyte boundaries stay intact
+                nl_idx = raw_chunk.find(b"\n")
+                if nl_idx != -1:
+                    raw_chunk = raw_chunk[nl_idx + 1 :]
+            chunk = normalize_proxy_text(_decode_bytes_utf8_or_cp1251(raw_chunk))
             lines = [ln.strip() for ln in chunk.splitlines() if ln.strip()]
             return lines[-probe.tail_lines :]
         except OSError:

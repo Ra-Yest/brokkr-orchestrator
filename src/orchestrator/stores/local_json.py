@@ -281,6 +281,7 @@ class LocalJsonTaskStore(BaseTaskStore):
                 "status": TaskStatus.TODO,
                 "attempts": 0,
                 "review_rounds": 0,
+                "pre_review_approved": False,
                 "failure_reason": None,
                 "wip_commit_sha": None,
                 "changed_files": [],

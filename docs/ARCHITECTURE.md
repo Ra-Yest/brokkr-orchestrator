@@ -177,6 +177,7 @@ diff_guard:
   architect_limit:  { soft_max_files: int?, soft_max_lines: int?, hard_max_files: int, hard_max_lines: int }
   refactorer_limit: { soft_max_files: int?, soft_max_lines: int?, hard_max_files: int, hard_max_lines: int }
   exclude_from_review: [glob]
+  readonly_ignore_paths: [glob]    # Default: ["go.work.sum", "**/go.work.sum"] (ignored & cleaned for read-only roles)
 
 placeholder_guard:
   enabled: bool
@@ -193,6 +194,7 @@ gates:
     cwd: string?
 
 workflow:
+  max_attempts: int                # Default: 6 (strict ceiling on total worker attempts per task; overridable per task)
   max_review_rounds: int           # Default: 3
   max_gate_retries_per_round: int  # Default: 3
   hard_split_after_rounds: int     # Default: 2 (<= max_review_rounds)
@@ -265,6 +267,7 @@ proxy_monitor:
       "stage": "stage-1",
       "attempts": 0,
       "review_rounds": 0,
+      "pre_review_approved": false,
       "parent_task_id": null,
       "subtask_ids": [],
       "resolution": null,

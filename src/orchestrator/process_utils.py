@@ -193,9 +193,10 @@ if sys.platform == "win32":
                 return False
             return bool(self._kernel32.AssignProcessToJobObject(self._handle, process_handle))
 
-        def terminate(self, exit_code: int = 1) -> None:
+        def terminate(self, exit_code: int = 1) -> bool:
             if self._handle:
-                self._kernel32.TerminateJobObject(self._handle, exit_code)
+                return bool(self._kernel32.TerminateJobObject(self._handle, exit_code))
+            return False
 
         def close(self) -> None:
             if self._handle:
@@ -206,21 +207,26 @@ if sys.platform == "win32":
 def _kill_process_tree(proc: subprocess.Popen[bytes], job: object | None = None) -> None:
     """Terminate a process and all its children reliably across Windows and POSIX."""
     if sys.platform == "win32":
+        job_terminated = False
         if job is not None and hasattr(job, "terminate"):
             with contextlib.suppress(Exception):
-                job.terminate(1)
-        try:
-            subprocess.run(
-                ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                timeout=10,
-                check=False,
-            )
-        except Exception:
-            with contextlib.suppress(OSError):
-                proc.kill()
+                job_terminated = bool(job.terminate(1))
+        if job_terminated:
+            with contextlib.suppress(subprocess.TimeoutExpired, OSError):
+                proc.wait(timeout=0.5)
+        if not job_terminated or proc.poll() is None:
+            try:
+                subprocess.run(
+                    ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    timeout=5,
+                    check=False,
+                )
+            except Exception:
+                with contextlib.suppress(OSError):
+                    proc.kill()
         return
 
     try:
@@ -417,6 +423,7 @@ def run_noninteractive_process(
 
     timed_out = False
     idle_timed_out = False
+    interrupted = False
     exit_code = -1
 
     try:
@@ -459,14 +466,39 @@ def run_noninteractive_process(
                         exit_code = proc.returncode if proc.returncode is not None else -1
                         break
             time.sleep(poll_interval)
+    except BaseException:
+        interrupted = True
+        _kill_process_tree(proc, job=job)
+        with contextlib.suppress(subprocess.TimeoutExpired, OSError):
+            proc.wait(timeout=1.5)
+        if sys.platform == "win32" and job is not None and hasattr(job, "close"):
+            with contextlib.suppress(Exception):
+                job.close()
+            job = None
+        for stream in (proc.stdin, proc.stdout, proc.stderr):
+            if stream is not None:
+                with contextlib.suppress(OSError, ValueError):
+                    stream.close()
+        raise
     finally:
-        join_timeout = 5.0 if timed_out else 15.0
+        if interrupted:
+            join_timeout = 1.5
+        elif timed_out:
+            join_timeout = 5.0
+        else:
+            join_timeout = 15.0
+        if interrupted or timed_out:
+            for stream in (proc.stdout, proc.stderr):
+                if stream is not None:
+                    with contextlib.suppress(OSError, ValueError):
+                        stream.close()
         stdout_thread.join(timeout=join_timeout)
         stderr_thread.join(timeout=join_timeout)
         if stdin_thread is not None:
-            stdin_thread.join(timeout=2.0)
+            stdin_thread.join(timeout=1.0 if interrupted else 2.0)
         if sys.platform == "win32" and job is not None and hasattr(job, "close"):
-            job.close()
+            with contextlib.suppress(Exception):
+                job.close()
 
     with lock:
         stdout = "".join(stdout_chunks).replace("\r\n", "\n")
