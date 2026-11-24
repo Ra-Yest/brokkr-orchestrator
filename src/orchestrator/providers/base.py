@@ -28,6 +28,7 @@ class ProviderRequest(BaseModel):
     workdir: Path
     timeout_seconds: int = Field(default=900, ge=1)
     idle_timeout_seconds: int | None = Field(default=None, ge=1)
+    idle_check_process_cpu: bool = True
     attempt_dir: Path
     extra_env: dict[str, str] = Field(default_factory=dict)
     on_first_output: Callable[[str], None] | None = Field(default=None, exclude=True)

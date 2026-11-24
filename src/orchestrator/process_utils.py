@@ -117,8 +117,27 @@ def resolve_executable(
 if sys.platform == "win32":
     from ctypes import wintypes
 
+    _JOB_OBJECT_BASIC_ACCOUNTING_INFORMATION_CLASS = 1
     _JOB_OBJECT_EXTENDED_LIMIT_INFORMATION_CLASS = 9
     _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000
+
+    class _FILETIME(ctypes.Structure):
+        _fields_ = [
+            ("dwLowDateTime", wintypes.DWORD),
+            ("dwHighDateTime", wintypes.DWORD),
+        ]
+
+    class _JOBOBJECT_BASIC_ACCOUNTING_INFORMATION(ctypes.Structure):
+        _fields_ = [
+            ("TotalUserTime", wintypes.LARGE_INTEGER),
+            ("TotalKernelTime", wintypes.LARGE_INTEGER),
+            ("ThisPeriodTotalUserTime", wintypes.LARGE_INTEGER),
+            ("ThisPeriodTotalKernelTime", wintypes.LARGE_INTEGER),
+            ("TotalPageFaultCount", wintypes.DWORD),
+            ("TotalProcesses", wintypes.DWORD),
+            ("ActiveProcesses", wintypes.DWORD),
+            ("TotalTerminatedProcesses", wintypes.DWORD),
+        ]
 
     class _IO_COUNTERS(ctypes.Structure):
         _fields_ = [
@@ -167,6 +186,14 @@ if sys.platform == "win32":
                 wintypes.DWORD,
             ]
             self._kernel32.SetInformationJobObject.restype = wintypes.BOOL
+            self._kernel32.QueryInformationJobObject.argtypes = [
+                wintypes.HANDLE,
+                wintypes.INT,
+                wintypes.LPVOID,
+                wintypes.DWORD,
+                ctypes.POINTER(wintypes.DWORD),
+            ]
+            self._kernel32.QueryInformationJobObject.restype = wintypes.BOOL
             self._kernel32.AssignProcessToJobObject.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
             self._kernel32.AssignProcessToJobObject.restype = wintypes.BOOL
             self._kernel32.TerminateJobObject.argtypes = [wintypes.HANDLE, wintypes.UINT]
@@ -176,6 +203,7 @@ if sys.platform == "win32":
 
             handle = self._kernel32.CreateJobObjectW(None, None)
             self._handle: int | None = int(handle) if handle else None
+            self._assigned: bool = False
             if self._handle:
                 info = _JOBOBJECT_EXTENDED_LIMIT_INFORMATION()
                 info.BasicLimitInformation.LimitFlags = _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
@@ -191,7 +219,28 @@ if sys.platform == "win32":
         def assign(self, process_handle: int) -> bool:
             if not self._handle:
                 return False
-            return bool(self._kernel32.AssignProcessToJobObject(self._handle, process_handle))
+            ok = bool(self._kernel32.AssignProcessToJobObject(self._handle, process_handle))
+            if ok:
+                self._assigned = True
+            return ok
+
+        def query_cpu_seconds(self) -> float | None:
+            """Return cumulative user + kernel CPU seconds for all processes in this Job Object."""
+            if not self._handle or not self._assigned:
+                return None
+            info = _JOBOBJECT_BASIC_ACCOUNTING_INFORMATION()
+            returned = wintypes.DWORD(0)
+            ok = self._kernel32.QueryInformationJobObject(
+                self._handle,
+                _JOB_OBJECT_BASIC_ACCOUNTING_INFORMATION_CLASS,
+                ctypes.byref(info),
+                ctypes.sizeof(info),
+                ctypes.byref(returned),
+            )
+            if not ok:
+                return None
+            total_100ns = int(info.TotalUserTime) + int(info.TotalKernelTime)
+            return total_100ns / 10_000_000.0
 
         def terminate(self, exit_code: int = 1) -> bool:
             if self._handle:
@@ -202,6 +251,101 @@ if sys.platform == "win32":
             if self._handle:
                 self._kernel32.CloseHandle(self._handle)
                 self._handle = None
+                self._assigned = False
+
+
+def _query_process_cpu_seconds_windows_fallback(proc: subprocess.Popen[bytes]) -> float | None:
+    """Fallback CPU time query via Win32 GetProcessTimes for the main process."""
+    if sys.platform != "win32":
+        return None
+    from ctypes import wintypes
+
+    kernel32 = ctypes.windll.kernel32
+    kernel32.GetProcessTimes.argtypes = [
+        wintypes.HANDLE,
+        ctypes.POINTER(_FILETIME),
+        ctypes.POINTER(_FILETIME),
+        ctypes.POINTER(_FILETIME),
+        ctypes.POINTER(_FILETIME),
+    ]
+    kernel32.GetProcessTimes.restype = wintypes.BOOL
+
+    handle = getattr(proc, "_handle", None)
+    opened_handle: int | None = None
+    try:
+        if handle is None:
+            process_query_limited_info = 0x1000
+            kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+            kernel32.OpenProcess.restype = wintypes.HANDLE
+            kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+            kernel32.CloseHandle.restype = wintypes.BOOL
+            opened = kernel32.OpenProcess(process_query_limited_info, False, proc.pid)
+            if not opened:
+                return None
+            opened_handle = int(opened)
+            target_handle = opened_handle
+        else:
+            target_handle = int(handle)
+
+        creation = _FILETIME()
+        exit_ft = _FILETIME()
+        kernel = _FILETIME()
+        user = _FILETIME()
+        ok = kernel32.GetProcessTimes(
+            target_handle,
+            ctypes.byref(creation),
+            ctypes.byref(exit_ft),
+            ctypes.byref(kernel),
+            ctypes.byref(user),
+        )
+        if not ok:
+            return None
+        k_100ns = (int(kernel.dwHighDateTime) << 32) | int(kernel.dwLowDateTime)
+        u_100ns = (int(user.dwHighDateTime) << 32) | int(user.dwLowDateTime)
+        return (k_100ns + u_100ns) / 10_000_000.0
+    except Exception:
+        return None
+    finally:
+        if opened_handle is not None:
+            with contextlib.suppress(Exception):
+                kernel32.CloseHandle(opened_handle)
+
+
+def _query_process_cpu_seconds_posix(pid: int) -> float | None:
+    """Read cumulative process + waited-children CPU seconds from /proc/<pid>/stat on POSIX."""
+    try:
+        stat_text = Path(f"/proc/{pid}/stat").read_text(encoding="ascii", errors="replace")
+        rparen = stat_text.rfind(")")
+        if rparen < 0:
+            return None
+        fields = stat_text[rparen + 2 :].split()
+        if len(fields) < 15:
+            return None
+        utime = int(fields[11])
+        stime = int(fields[12])
+        cutime = int(fields[13])
+        cstime = int(fields[14])
+        clk_tck = os.sysconf("SC_CLK_TCK") if hasattr(os, "sysconf") else 100
+        if clk_tck <= 0:
+            clk_tck = 100
+        return (utime + stime + cutime + cstime) / float(clk_tck)
+    except Exception:
+        return None
+
+
+def _query_process_tree_cpu_seconds(
+    proc: subprocess.Popen[bytes],
+    job: object | None = None,
+) -> float | None:
+    """Return cumulative CPU seconds for the process tree (Job Object on Windows, /proc on POSIX)."""
+    if sys.platform == "win32":
+        if job is not None and hasattr(job, "query_cpu_seconds"):
+            with contextlib.suppress(Exception):
+                val = job.query_cpu_seconds()
+                if val is not None:
+                    return float(val)
+        return _query_process_cpu_seconds_windows_fallback(proc)
+    return _query_process_cpu_seconds_posix(proc.pid)
 
 
 def _kill_process_tree(proc: subprocess.Popen[bytes], job: object | None = None) -> None:
@@ -256,6 +400,8 @@ def run_noninteractive_process(
     on_stderr_chunk: Callable[[str], None] | None = None,
     workspace_watch_dir: Path | None = None,
     workspace_ignore_dirs: set[str] | frozenset[str] | None = None,
+    idle_check_process_cpu: bool = True,
+    idle_cpu_min_delta_seconds: float = 0.05,
 ) -> ProcessRunResult:
     """Run a subprocess in strict non-interactive mode with streaming stdout/stderr and idle/hard timeout."""
     merged_env = dict(os.environ)
@@ -409,6 +555,11 @@ def run_noninteractive_process(
         if idle_timeout_seconds is not None
         else None
     )
+    last_cpu_seconds = (
+        _query_process_tree_cpu_seconds(proc, job)
+        if (idle_timeout_seconds is not None and idle_check_process_cpu)
+        else None
+    )
     last_ws_check = start_time
     ws_check_interval = (
         min(1.0, max(0.05, idle_timeout_seconds / 4.0))
@@ -444,17 +595,39 @@ def run_noninteractive_process(
                 if now - last_ws_check >= ws_check_interval:
                     cur_sig = _workspace_activity_signature(watch_dir, ignore_set)
                     last_ws_check = now
+                    activity_detected = False
                     if last_ws_sig is not None and cur_sig != last_ws_sig:
                         last_ws_sig = cur_sig
+                        activity_detected = True
+                    if idle_check_process_cpu:
+                        cur_cpu = _query_process_tree_cpu_seconds(proc, job)
+                        if cur_cpu is not None:
+                            if last_cpu_seconds is None:
+                                last_cpu_seconds = cur_cpu
+                            elif cur_cpu - last_cpu_seconds >= idle_cpu_min_delta_seconds:
+                                last_cpu_seconds = cur_cpu
+                                activity_detected = True
+                    if activity_detected:
                         with lock:
                             last_activity[0] = now
                 with lock:
                     idle_for = now - last_activity[0]
                 if idle_for >= idle_timeout_seconds:
-                    # Final workspace mtime check before killing
+                    # Final workspace mtime & process-tree CPU check before killing
                     cur_sig = _workspace_activity_signature(watch_dir, ignore_set)
+                    still_active = False
                     if last_ws_sig is not None and cur_sig != last_ws_sig:
                         last_ws_sig = cur_sig
+                        still_active = True
+                    if idle_check_process_cpu:
+                        cur_cpu = _query_process_tree_cpu_seconds(proc, job)
+                        if cur_cpu is not None:
+                            if last_cpu_seconds is None:
+                                last_cpu_seconds = cur_cpu
+                            elif cur_cpu - last_cpu_seconds >= idle_cpu_min_delta_seconds:
+                                last_cpu_seconds = cur_cpu
+                                still_active = True
+                    if still_active:
                         with lock:
                             last_activity[0] = now
                     else:

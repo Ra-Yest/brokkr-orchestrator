@@ -149,6 +149,7 @@ class EventType(StrEnum):
     RUN_ABORTED = "run_aborted"
     ORCHESTRATOR_FATAL_ERROR = "orchestrator_fatal_error"
     TASK_CLAIMED = "task_claimed"
+    TASK_DEFERRED_COOLDOWN = "task_deferred_cooldown"
     TASK_STATUS_CHANGED = "task_status_changed"
     PROVIDER_INVOKED = "provider_invoked"
     PROVIDER_RESPONSE_STARTED = "provider_response_started"

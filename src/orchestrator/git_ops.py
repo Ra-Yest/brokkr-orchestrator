@@ -165,6 +165,22 @@ class GitOps:
         res = self._run(args)
         return res.stdout
 
+    def get_diff_stat(self, base_sha: str, paths: list[str] | None = None) -> str:
+        """Return full `git diff --stat` relative to base_sha (includes intent-to-add files)."""
+        args = ["diff", "--stat", "--no-ext-diff", "--no-color", base_sha]
+        if paths:
+            args.extend(["--", *paths])
+        res = self._run(args)
+        return res.stdout
+
+    def get_commit_diff_stat(self, commit_sha: str) -> str:
+        """Return `git show --stat --format=` for a single commit."""
+        res = self._run(
+            ["show", "--stat", "--format=", "--no-ext-diff", "--no-color", commit_sha],
+            check=False,
+        )
+        return res.stdout if res.exit_code == 0 else ""
+
     def commit_all(self, message: str, *, exclude_pipeline_dir: bool = True) -> str:
         """Stage all non-ignored repository changes (excluding pipeline_dir) and commit."""
         self._run(["add", "-A"])

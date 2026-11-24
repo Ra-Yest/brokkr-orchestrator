@@ -71,6 +71,7 @@ providers:
     output_parser: "plain"
     timeout_seconds: 900
     idle_timeout_seconds: 300
+    idle_check_process_cpu: true
     anti_laziness: false
     rate_limit_cooldown_seconds: 900
     quota_window_seconds: 18000
@@ -273,6 +274,20 @@ workflow:
   auto_commit: true
   commit_prefix: "feat"
   strict_clean_start: true
+  # Review prompt diff trimming (applies strictly to pre_reviewer/reviewer prompts, NOT diff_guard/gates/commit)
+  review_diff_exclude_patterns:
+    - "*.lock"
+    - "**/pubspec.lock"
+    - "**/go.sum"
+    - "**/go.work.sum"
+    - "**/*_gen.go"
+    - "**/*_gen.dart"
+    - "**/*.g.dart"
+    - "**/*.freezed.dart"
+  review_diff_max_file_lines: 400
+  review_diff_max_chars: 80000
+  # Keep active silent CLI processes alive when process-tree CPU time increases
+  idle_check_process_cpu: true
 
 notifications:
   telegram:

@@ -198,6 +198,7 @@ class ProviderProfileConfig(BaseModel):
     env: dict[str, EnvSpecValue] = Field(default_factory=dict)
     timeout_seconds: int = Field(default=900, ge=1)
     idle_timeout_seconds: int | None = Field(default=None, ge=1)
+    idle_check_process_cpu: bool | None = None
     anti_laziness: bool = False
     rate_limit_patterns: list[str] = Field(
         default_factory=lambda: list(DEFAULT_RATE_LIMIT_PATTERNS)
@@ -378,6 +379,17 @@ DEFAULT_READONLY_IGNORE_PATHS: list[str] = [
     "**/go.work.sum",
 ]
 
+DEFAULT_REVIEW_DIFF_EXCLUDE_PATTERNS: list[str] = [
+    "*.lock",
+    "**/pubspec.lock",
+    "**/go.sum",
+    "**/go.work.sum",
+    "**/*_gen.go",
+    "**/*_gen.dart",
+    "**/*.g.dart",
+    "**/*.freezed.dart",
+]
+
 
 class DiffGuardConfig(BaseModel):
     exclude_tests_from_limits: bool = True
@@ -461,6 +473,12 @@ class WorkflowConfig(BaseModel):
     auto_commit: bool = True
     commit_prefix: str = "feat"
     strict_clean_start: bool = True
+    review_diff_exclude_patterns: list[str] = Field(
+        default_factory=lambda: list(DEFAULT_REVIEW_DIFF_EXCLUDE_PATTERNS)
+    )
+    review_diff_max_file_lines: int = Field(default=400, ge=1)
+    review_diff_max_chars: int = Field(default=80000, ge=1)
+    idle_check_process_cpu: bool = True
 
     @model_validator(mode="after")
     def _validate_workflow(self) -> WorkflowConfig:

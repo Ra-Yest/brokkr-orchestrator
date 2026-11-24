@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import math
 import sys
 import uuid
 from collections.abc import Callable
@@ -123,13 +124,15 @@ class QuotaTracker:
             return 0
         wait_seconds = 0
         if q.cooldown_until is not None:
-            delta = int((_parse_iso(q.cooldown_until) - current).total_seconds())
-            wait_seconds = max(wait_seconds, delta)
+            delta_float = (_parse_iso(q.cooldown_until) - current).total_seconds()
+            if delta_float > 0:
+                wait_seconds = max(wait_seconds, math.ceil(delta_float))
         if q.max_requests is not None and q.requests_in_window >= q.max_requests and q.request_timestamps:
             oldest = _parse_iso(q.request_timestamps[0])
             window_release = oldest + timedelta(seconds=q.window_seconds)
-            delta = int((window_release - current).total_seconds())
-            wait_seconds = max(wait_seconds, delta)
+            delta_float = (window_release - current).total_seconds()
+            if delta_float > 0:
+                wait_seconds = max(wait_seconds, math.ceil(delta_float))
         return max(0, wait_seconds)
 
 
@@ -157,6 +160,16 @@ def format_console_event(event: PipelineEvent) -> str | None:
         return (
             f"[{ts}] task_claimed #{event.task_id} ({p.get('complexity', '?')}) "
             f"role={role_val} provider={prov_val}"
+        )
+
+    if et == EventType.TASK_DEFERRED_COOLDOWN:
+        provs = p.get("providers")
+        prov_str = ",".join(str(x) for x in provs) if isinstance(provs, list) and provs else prov_val
+        selected = p.get("selected_task_id")
+        sel_part = f" -> picking #{selected}" if selected else ""
+        return (
+            f"[{ts}] task_deferred_cooldown #{event.task_id} ({p.get('complexity', '?')}) "
+            f"role={role_val} providers={prov_str} wait={p.get('wait_seconds', 0)}s{sel_part}"
         )
 
     if et == EventType.PROVIDER_INVOKED:

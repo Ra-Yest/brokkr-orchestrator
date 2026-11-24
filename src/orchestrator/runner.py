@@ -35,6 +35,7 @@ from orchestrator.gates import GateRunner
 from orchestrator.git_ops import GitChange, GitOperationError, GitOps
 from orchestrator.models import (
     READ_ONLY_ROLES,
+    WORKER_ROLES,
     WRITING_ROLES,
     AgentRole,
     ControlAction,
@@ -163,6 +164,24 @@ class _AbortedByControlError(Exception):
     """Internal flow-control signal raised when an operator sends `abort`."""
 
 
+class _TaskDeferredOnCooldownError(Exception):
+    """Internal signal to return a clean worker task to TODO when another task can run sooner."""
+
+    def __init__(
+        self,
+        *,
+        task_id: str,
+        role: AgentRole,
+        providers: list[str],
+        wait_seconds: int,
+    ) -> None:
+        super().__init__(f"Task #{task_id} deferred on cooldown ({wait_seconds}s)")
+        self.task_id = task_id
+        self.role = role
+        self.providers = providers
+        self.wait_seconds = wait_seconds
+
+
 class _PausedByInfraError(Exception):
     """Raised when a review/architect/planner/proxy monitor fails so work is preserved."""
 
@@ -246,6 +265,7 @@ class OrchestratorRunner:
         self._lock_acquired = False
         self._abort_requested = False
         self._batch_diffs: dict[str, str] = {}
+        self._batch_diff_stats: dict[str, str] = {}
         self._attempt_counter: dict[str, int] = {}
         self._last_proxy_key: tuple[str, bool, bool, str | None] | None = None
         self._resumable_needs_review_base_sha: dict[str, str] = {}
@@ -370,7 +390,9 @@ class OrchestratorRunner:
                         tasks_processed += 1
                     continue
 
-                next_task = self.store.get_next_available_task()
+                next_task, woke_from_hibernation = self._select_next_runnable_task()
+                if woke_from_hibernation:
+                    continue
 
                 if next_task is None:
                     if self._get_batch_pending_tasks():
@@ -402,7 +424,9 @@ class OrchestratorRunner:
                     continue
 
                 last_stage = next_task.stage
-                self._execute_task(next_task)
+                executed = self._execute_task(next_task)
+                if not executed:
+                    continue
                 tasks_processed += 1
 
                 # Flush batch if batch size threshold reached
@@ -1105,6 +1129,79 @@ class OrchestratorRunner:
                 best_wait = wait
         return best_name, best_wait, candidates
 
+    def _list_available_todo_tasks(self) -> list[Task]:
+        """Return all unlocked TODO tasks in deterministic queue order."""
+        available: list[Task] = []
+        seen: set[str] = set()
+        while True:
+            candidate = self.store.get_next_available_task(exclude_ids=seen)
+            if candidate is None or candidate.id in seen:
+                break
+            available.append(candidate)
+            seen.add(candidate.id)
+        return available
+
+    def _should_defer_task_on_cooldown(self, current_task_id: str, current_min_wait: int) -> bool:
+        """Return True if another unlocked TODO task can run now or wakes sooner than current_min_wait."""
+        for candidate in self._list_available_todo_tasks():
+            if candidate.id == current_task_id:
+                continue
+            cand_role = self._worker_role_for(candidate.complexity)
+            _, cand_wait, _ = self._select_available_provider_for_role(cand_role)
+            if cand_wait == 0 or cand_wait < current_min_wait:
+                return True
+        return False
+
+    def _select_next_runnable_task(self) -> tuple[Task | None, bool]:
+        """Pick the first unlocked TODO task with an available provider, or hibernate until earliest cooldown.
+
+        Returns (selected_task_or_none, woke_from_hibernation).
+        """
+        available = self._list_available_todo_tasks()
+        if not available:
+            return None, False
+
+        skipped: list[tuple[Task, AgentRole, list[str], int]] = []
+        for candidate in available:
+            worker_role = self._worker_role_for(candidate.complexity)
+            _, wait_seconds, candidates = self._select_available_provider_for_role(worker_role)
+            if wait_seconds == 0:
+                for skipped_task, skipped_role, skipped_candidates, skipped_wait in skipped:
+                    self.event_bus.emit(
+                        EventType.TASK_DEFERRED_COOLDOWN,
+                        task_id=skipped_task.id,
+                        role=skipped_role,
+                        provider=skipped_candidates[0] if skipped_candidates else None,
+                        payload={
+                            "complexity": skipped_task.complexity.value,
+                            "providers": skipped_candidates,
+                            "wait_seconds": skipped_wait,
+                            "selected_task_id": candidate.id,
+                            "reason": "all_role_providers_in_cooldown",
+                        },
+                    )
+                return candidate, False
+            skipped.append((candidate, worker_role, candidates, wait_seconds))
+
+        # No unlocked TODO task can run right now -> hibernate until the earliest cooldown_until
+        earliest_task, earliest_role, _, min_wait = min(skipped, key=lambda item: item[3])
+        all_blocked_providers: list[str] = []
+        for _, _, cands, _ in skipped:
+            for pname in cands:
+                if pname not in all_blocked_providers:
+                    all_blocked_providers.append(pname)
+
+        resume_dt = datetime.now(UTC) + timedelta(seconds=max(1, min_wait))
+        self._hibernate_until(
+            resume_dt=resume_dt,
+            providers=all_blocked_providers,
+            task_id=earliest_task.id,
+            role=earliest_role,
+        )
+        if self._abort_requested:
+            raise _AbortedByControlError()
+        return None, True
+
     def _poll_proxy_monitor_for_provider(
         self,
         provider: BaseAgentProvider,
@@ -1445,6 +1542,11 @@ class OrchestratorRunner:
                 for part in (built_prompt.semi_static_layer, built_prompt.dynamic_tail)
                 if part
             )
+            idle_check_cpu = (
+                provider.profile.idle_check_process_cpu
+                if provider.profile.idle_check_process_cpu is not None
+                else self.config.workflow.idle_check_process_cpu
+            )
             request = ProviderRequest(
                 run_id=self.event_bus.run_id,
                 task_id=task_id,
@@ -1456,6 +1558,7 @@ class OrchestratorRunner:
                 workdir=self.repo_root,
                 timeout_seconds=provider.profile.timeout_seconds,
                 idle_timeout_seconds=provider.profile.idle_timeout_seconds,
+                idle_check_process_cpu=idle_check_cpu,
                 attempt_dir=attempt_dir,
                 on_first_output=_on_first_output,
             )
@@ -1521,8 +1624,25 @@ class OrchestratorRunner:
                     )
                     continue
 
-                # All candidates are in cooldown/quota-capped -> hibernate until earliest availability
+                # All candidates are in cooldown/quota-capped -> defer to another runnable task if possible
+                # (only defer mid-task for meaningful cooldowns >= 10s; tiny 1-9s waits complete in place)
                 _, min_wait, all_candidates = self._select_available_provider_for_role(role)
+                if (
+                    role in WORKER_ROLES
+                    and task_id is not None
+                    and min_wait >= 10
+                    and not git_tree_changed
+                    and not self.git_ops.has_uncommitted_changes()
+                    and self.git_ops.get_head_sha() == base_sha
+                    and self._should_defer_task_on_cooldown(task_id, min_wait)
+                ):
+                    raise _TaskDeferredOnCooldownError(
+                        task_id=task_id,
+                        role=role,
+                        providers=all_candidates,
+                        wait_seconds=min_wait,
+                    )
+
                 resume_dt = datetime.now(UTC) + timedelta(seconds=max(1, min_wait))
                 self._hibernate_until(
                     resume_dt=resume_dt,
@@ -1932,7 +2052,7 @@ class OrchestratorRunner:
         )
         return updated
 
-    def _execute_task(self, task: Task) -> None:
+    def _execute_task(self, task: Task) -> bool:
         # Clean up lingering dev-server/test ports before starting the task
         if self.config.workflow.cleanup_ports:
             cleanup_ports(self.config.workflow.cleanup_ports)
@@ -1989,7 +2109,7 @@ class OrchestratorRunner:
                     task_base_sha,
                     reason=f"Reached max_attempts ({max_attempts}) without completing task.",
                 )
-                return
+                return True
 
             gates_passed_this_round = False
             last_guard_report: DiffGuardReport | None = None
@@ -2002,7 +2122,7 @@ class OrchestratorRunner:
                         task_base_sha,
                         reason=f"Reached max_attempts ({max_attempts}) without completing task.",
                     )
-                    return
+                    return True
 
                 _, attempt_dir = self._next_attempt_dir(task.id)
 
@@ -2024,15 +2144,26 @@ class OrchestratorRunner:
                     extra_instructions=extra_inst,
                 )
 
-                response, guard_report = self._invoke_provider_guarded(
-                    role=worker_role,
-                    built_prompt=built_prompt,
-                    task_id=task.id,
-                    attempt_dir=attempt_dir,
-                    base_sha=task_base_sha,
-                    task_complexity=task.complexity,
-                    allowed_paths=task.allowed_paths,
-                )
+                try:
+                    response, guard_report = self._invoke_provider_guarded(
+                        role=worker_role,
+                        built_prompt=built_prompt,
+                        task_id=task.id,
+                        attempt_dir=attempt_dir,
+                        base_sha=task_base_sha,
+                        task_complexity=task.complexity,
+                        allowed_paths=task.allowed_paths,
+                    )
+                except _TaskDeferredOnCooldownError:
+                    self._transition_task(task.id, TaskStatus.TODO)
+                    self.event_bus.update_state(
+                        active_task_id=None,
+                        active_task_base_sha=None,
+                        active_phase="deferred_cooldown",
+                        active_role=None,
+                        active_provider=None,
+                    )
+                    return False
                 task = self.store.update_task_fields(task.id, attempts=task.attempts + 1)
 
                 # Honor `control abort` AND `pause_after_current` immediately after a provider step
@@ -2077,7 +2208,7 @@ class OrchestratorRunner:
                                 f"{guard_report.summary_text()[:240]}"
                             ),
                         )
-                        return
+                        return True
                     guard_error_text = (
                         "Your previous attempt was ROLLED BACK because of a Red Zone violation:\n"
                         + guard_report.summary_text()
@@ -2101,7 +2232,7 @@ class OrchestratorRunner:
                             task_base_sha,
                             reason=f"Architect could not resolve escalation: {guidance}",
                         )
-                        return
+                        return True
                     task_base_sha = new_base
                     self.event_bus.update_state(active_task_base_sha=task_base_sha)
                     architect_notes = guidance
@@ -2121,7 +2252,7 @@ class OrchestratorRunner:
                                 f"idle_timed_out={response.idle_timed_out})."
                             ),
                         )
-                        return
+                        return True
                     guard_error_text = (
                         f"Provider execution failed (exit_code={response.exit_code}, "
                         f"timed_out={response.timed_out}, idle_timed_out={response.idle_timed_out}). "
@@ -2167,7 +2298,7 @@ class OrchestratorRunner:
                                     f"{guard_report.summary_text()[:240]}"
                                 ),
                             )
-                            return
+                            return True
                         last_diff_guard_sig = diff_sig
                     else:
                         last_diff_guard_sig = None
@@ -2181,7 +2312,7 @@ class OrchestratorRunner:
                                 f"{guard_report.summary_text()[:240]}"
                             ),
                         )
-                        return
+                        return True
                     guard_error_text = guard_report.summary_text()
                     task = self._transition_task(task.id, TaskStatus.GATES_FAILED)
                     task = self._transition_task(task.id, TaskStatus.IN_PROGRESS)
@@ -2219,7 +2350,7 @@ class OrchestratorRunner:
                                 f"{', '.join(failed_names)}"
                             ),
                         )
-                        return
+                        return True
                     gate_error_log = gates_res.combined_trimmed_log
                     task = self._transition_task(task.id, TaskStatus.GATES_FAILED)
                     task = self._transition_task(task.id, TaskStatus.IN_PROGRESS)
@@ -2245,14 +2376,14 @@ class OrchestratorRunner:
                     and new_rounds == self.config.workflow.hard_split_after_rounds
                     and self._try_split_hard_task(task, task_base_sha)
                 ):
-                    return
+                    return True
                 if new_rounds >= max_rounds:
                     self._fail_task_and_rollback(
                         task,
                         task_base_sha,
                         reason=f"Exceeded {max_rounds} rounds failing guards/gates.",
                     )
-                    return
+                    return True
                 continue
 
             if last_guard_report.touched_yellow_zone:
@@ -2292,6 +2423,8 @@ class OrchestratorRunner:
                 and not overlaps_batch
                 and self.config.workflow.batch_review_size > 1
             ):
+                batch_raw_diff = self.git_ops.get_diff(task_base_sha)
+                batch_diff_stat = self.git_ops.get_diff_stat(task_base_sha)
                 wip_sha: str | None = None
                 if last_guard_report.changed_files and self.config.workflow.auto_commit:
                     wip_sha = self.git_ops.commit_all(f"wip(task-{task.id}): {task.title}")
@@ -2305,7 +2438,8 @@ class OrchestratorRunner:
                     f"Completed `#{task.id}` ({task.title}). "
                     f"Files: {', '.join(last_guard_report.changed_files) or 'none'}."
                 )
-                self._batch_diffs[task.id] = last_guard_report.filtered_diff
+                self._batch_diffs[task.id] = batch_raw_diff or last_guard_report.filtered_diff
+                self._batch_diff_stats[task.id] = batch_diff_stat
                 self._transition_task(
                     task.id,
                     TaskStatus.BATCH_PENDING,
@@ -2316,7 +2450,7 @@ class OrchestratorRunner:
                     last_report=last_worker_parsed.report,
                 )
                 self._sync_batch_queue_from_store()
-                return
+                return True
 
             # Route B: Medium, Hard, Yellow-Zone-triggered, or Soft-Warning Easy -> Individual review
             pending_progress_note = last_worker_parsed.progress_update or (
@@ -2344,8 +2478,9 @@ class OrchestratorRunner:
                 on_reject_status=TaskStatus.IN_PROGRESS,
             )
             if outcome != "rejected":
-                return
+                return True
             review_feedback = rejected_feedback
+        return True
 
     def _run_needs_review_pipeline(
         self,
@@ -2576,13 +2711,17 @@ class OrchestratorRunner:
     ) -> tuple[bool, str]:
         _, attempt_dir = self._next_attempt_dir(f"{task.id}_{role.value}")
         profile = self.registry.for_role(role).profile
+        diff_stat = self.git_ops.get_diff_stat(base_sha)
+        raw_diff_for_review = self.git_ops.get_diff(base_sha)
+        review_diff_input = raw_diff_for_review if raw_diff_for_review.strip() else filtered_diff
         built_prompt = self.prompt_builder.build(
             role=role,
             profile=profile,
             repo_map_text=repo_map_text,
             progress_text=self._read_progress_text(),
             task=task,
-            filtered_diff=filtered_diff,
+            filtered_diff=review_diff_input,
+            diff_stat=diff_stat,
             last_report=last_report,
             extra_instructions=soft_warning_note,
         )
@@ -2651,13 +2790,18 @@ class OrchestratorRunner:
         )
 
         batch_items: list[tuple[Task, str, str]] = []
+        batch_diff_stats: dict[str, str] = {}
         for task in batch_tasks:
             diff_text = self._batch_diffs.get(task.id, "")
+            diff_stat = self._batch_diff_stats.get(task.id, "")
             if not diff_text and task.wip_commit_sha:
                 # Reconstruct diff from commit if resumed across runs
                 res = self.git_ops._run(["show", "--format=", task.wip_commit_sha], check=False)
                 if res.exit_code == 0:
                     diff_text = res.stdout
+            if not diff_stat and task.wip_commit_sha:
+                diff_stat = self.git_ops.get_commit_diff_stat(task.wip_commit_sha)
+            batch_diff_stats[task.id] = diff_stat
             batch_items.append((task, diff_text, task.last_report or ""))
 
         _, attempt_dir = self._next_attempt_dir("batch_review")
@@ -2669,6 +2813,7 @@ class OrchestratorRunner:
             repo_map_text=self._refresh_repo_map(),
             progress_text=self._read_progress_text(),
             batch_items=batch_items,
+            batch_diff_stats=batch_diff_stats,
         )
 
         response, guard_report = self._invoke_provider_guarded(
@@ -2730,6 +2875,7 @@ class OrchestratorRunner:
                 payload={"verdict": verdict.verdict.value},
             )
             self._batch_diffs.pop(task.id, None)
+            self._batch_diff_stats.pop(task.id, None)
 
             if verdict.verdict == ReviewVerdictType.APPROVE:
                 # Update PROGRESS.md ONLY after APPROVE (never at wip-commit time)

@@ -135,7 +135,8 @@ providers:
     env:                           # Supports ${VAR} (required), ${VAR:-default} (optional; omitted if ${VAR:-} unset),
       <KEY>: string | { from_env: string, optional: bool, default: string? }
     timeout_seconds: int           # Default: 900
-    idle_timeout_seconds: int?     # Optional stream + workspace mtime idle kill timeout
+    idle_timeout_seconds: int?     # Optional stream + workspace mtime + process-tree CPU idle kill timeout
+    idle_check_process_cpu: bool?  # Optional per-provider override for workflow.idle_check_process_cpu
     anti_laziness: bool            # Default: false; appends anti_laziness_openai.md to Layer 1 static prefix
     rate_limit_patterns: [regex]
     rate_limit_cooldown_seconds: int  # Default: 900
@@ -212,6 +213,10 @@ workflow:
   auto_commit: bool
   commit_prefix: string
   strict_clean_start: bool
+  review_diff_exclude_patterns: [glob]  # Excluded from pre_reviewer/reviewer diff body (still shown in --stat & exclusion list)
+  review_diff_max_file_lines: int       # Default: 400 (per-file diff line cap in review prompts)
+  review_diff_max_chars: int            # Default: 80000 (total diff char cap in review prompts)
+  idle_check_process_cpu: bool          # Default: true (tracks Windows JobObject/GetProcessTimes or POSIX /proc CPU activity)
 
 notifications:
   telegram:
@@ -308,7 +313,7 @@ Each line is a self-contained UTF-8 JSON object:
 ```
 
 Canonical `event_type` values:
-`run_started`, `run_finished`, `run_aborted`, `orchestrator_fatal_error`, `task_claimed`, `task_status_changed`, `provider_invoked`, `provider_response_started`, `provider_recovered_after_retry`, `provider_succeeded`, `provider_failed`, `provider_rate_limited`, `provider_transport_retry`, `provider_transient_retry`, `provider_fallback_used`, `provider_account_switched`, `provider_account_switch_failed`, `agent_commit_soft_reset`, `stale_lock_recovered`, `crash_recovery_completed`, `gate_started`, `gate_passed`, `gate_failed`, `placeholder_guard_failed`, `red_zone_violation`, `yellow_zone_triggered`, `diff_guard_soft_warning`, `diff_guard_failed`, `pre_review_completed`, `review_completed`, `batch_review_started`, `batch_review_deferred`, `batch_verdict_received`, `escalation_triggered`, `architect_resolved`, `task_split`, `refactor_started`, `refactor_finished`, `refactor_reverted`, `git_committed`, `git_reverted`, `task_rolled_back`, `control_command_applied`, `inbox_consumed`, `pause_entered`, `pause_resumed`, `runner_hibernating`, `runner_woke_up`, `proxy_status_changed`, `proxy_error`, `report_generated`.
+`run_started`, `run_finished`, `run_aborted`, `orchestrator_fatal_error`, `task_claimed`, `task_deferred_cooldown`, `task_status_changed`, `provider_invoked`, `provider_response_started`, `provider_recovered_after_retry`, `provider_succeeded`, `provider_failed`, `provider_rate_limited`, `provider_transport_retry`, `provider_transient_retry`, `provider_fallback_used`, `provider_account_switched`, `provider_account_switch_failed`, `agent_commit_soft_reset`, `stale_lock_recovered`, `crash_recovery_completed`, `gate_started`, `gate_passed`, `gate_failed`, `placeholder_guard_failed`, `red_zone_violation`, `yellow_zone_triggered`, `diff_guard_soft_warning`, `diff_guard_failed`, `pre_review_completed`, `review_completed`, `batch_review_started`, `batch_review_deferred`, `batch_verdict_received`, `escalation_triggered`, `architect_resolved`, `task_split`, `refactor_started`, `refactor_finished`, `refactor_reverted`, `git_committed`, `git_reverted`, `task_rolled_back`, `control_command_applied`, `inbox_consumed`, `pause_entered`, `pause_resumed`, `runner_hibernating`, `runner_woke_up`, `proxy_status_changed`, `proxy_error`, `report_generated`.
 
 ### 3.4 `state.json` Schema (Atomically Replaced Snapshot)
 

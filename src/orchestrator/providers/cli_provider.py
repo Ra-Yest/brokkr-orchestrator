@@ -182,6 +182,11 @@ class CliAgentProvider(BaseAgentProvider):
             if request.idle_timeout_seconds is not None
             else self.profile.idle_timeout_seconds
         )
+        idle_check_cpu = (
+            self.profile.idle_check_process_cpu
+            if self.profile.idle_check_process_cpu is not None
+            else request.idle_check_process_cpu
+        )
 
         # Store temporary prompt/output files strictly outside the target repo and .pipeline/
         with tempfile.TemporaryDirectory(prefix="orch_cli_") as tmp_dir_str:
@@ -213,6 +218,7 @@ class CliAgentProvider(BaseAgentProvider):
                 idle_timeout_seconds=idle_timeout_sec,
                 on_first_output=request.on_first_output,
                 workspace_watch_dir=request.workdir,
+                idle_check_process_cpu=idle_check_cpu,
             )
 
             file_output = ""
