@@ -41,6 +41,36 @@ class GatesRunResult:
     screenshots: list[str]
 
 
+def format_gate_execution_summary(
+    gates_result: GatesRunResult,
+    *,
+    configured_gates: list[GateConfig] | None = None,
+    verify_cmd: str | None = None,
+) -> str:
+    """Format a compact factual gate execution summary for pre_reviewer/reviewer prompts."""
+    lines: list[str] = []
+    executed_names: set[str] = set()
+    for res in gates_result.results:
+        executed_names.add(res.name)
+        cmd_str = " ".join(res.command)
+        status = "PASS" if res.passed else ("FAIL (optional)" if res.optional else "FAIL")
+        lines.append(
+            f"- `{res.name}` (`{cmd_str}`): **{status}** (exit={res.exit_code}, {res.duration_seconds:.1f}s)"
+        )
+
+    for gate in configured_gates or []:
+        if gate.name not in executed_names:
+            cmd_str = " ".join(gate.command)
+            lines.append(f"- `{gate.name}` (`{cmd_str}`): **SKIP** (not executed)")
+
+    if verify_cmd and verify_cmd.strip() and "task_verify_cmd" not in executed_names:
+        lines.append(f"- `task_verify_cmd` (`{verify_cmd.strip()}`): **SKIP** (not executed)")
+
+    if not lines:
+        return "- (no gates configured)"
+    return "\n".join(lines)
+
+
 def trim_error_log(
     text: str,
     *,

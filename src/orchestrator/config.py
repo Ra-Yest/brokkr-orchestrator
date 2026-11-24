@@ -175,6 +175,38 @@ DEFAULT_RATE_LIMIT_PATTERNS: list[str] = [
     r"usage limit reached",
 ]
 
+DEFAULT_CAPACITY_ERROR_PATTERNS: list[str] = [
+    "503",
+    "UNAVAILABLE",
+    "No capacity available",
+    "overloaded",
+    "Service Unavailable",
+]
+
+DEFAULT_TRANSIENT_ERROR_PATTERNS: list[str] = [
+    "502",
+    "Bad Gateway",
+    "ECONNRESET",
+    "ETIMEDOUT",
+    "socket hang up",
+]
+
+DEFAULT_STALL_STDOUT_PATTERNS: list[str] = [
+    r"waiting for \d+ background task",
+    r"root agent idle; waiting for",
+]
+
+DEFAULT_PAIRED_PATHS: dict[str, list[str]] = {
+    "**/pubspec.yaml": ["**/pubspec.lock"],
+    "**/go.mod": ["**/go.sum"],
+    "**/package.json": [
+        "**/package-lock.json",
+        "**/pnpm-lock.yaml",
+        "**/yarn.lock",
+    ],
+    "**/Cargo.toml": ["**/Cargo.lock"],
+}
+
 
 class ProviderProfileConfig(BaseModel):
     """Profile definition for a CLI or API agent provider."""
@@ -199,6 +231,8 @@ class ProviderProfileConfig(BaseModel):
     timeout_seconds: int = Field(default=900, ge=1)
     idle_timeout_seconds: int | None = Field(default=None, ge=1)
     idle_check_process_cpu: bool | None = None
+    stall_stdout_patterns: list[str] | None = None
+    stall_grace_seconds: int | None = Field(default=None, ge=1)
     anti_laziness: bool = False
     rate_limit_patterns: list[str] = Field(
         default_factory=lambda: list(DEFAULT_RATE_LIMIT_PATTERNS)
@@ -256,6 +290,12 @@ class ProviderProfileConfig(BaseModel):
                 re.compile(pattern)
             except re.error as exc:
                 raise ValueError(f"Invalid rate_limit_pattern '{pattern}': {exc}") from exc
+
+        for pattern in self.stall_stdout_patterns or []:
+            try:
+                re.compile(pattern)
+            except re.error as exc:
+                raise ValueError(f"Invalid stall_stdout_pattern '{pattern}': {exc}") from exc
 
         return self
 
@@ -436,6 +476,9 @@ class DiffGuardConfig(BaseModel):
     readonly_ignore_paths: list[str] = Field(
         default_factory=lambda: list(DEFAULT_READONLY_IGNORE_PATHS)
     )
+    paired_paths: dict[str, list[str]] = Field(
+        default_factory=lambda: {k: list(v) for k, v in DEFAULT_PAIRED_PATHS.items()}
+    )
 
 
 class PlaceholderGuardConfig(BaseModel):
@@ -479,6 +522,19 @@ class WorkflowConfig(BaseModel):
     review_diff_max_file_lines: int = Field(default=400, ge=1)
     review_diff_max_chars: int = Field(default=80000, ge=1)
     idle_check_process_cpu: bool = True
+    capacity_error_patterns: list[str] = Field(
+        default_factory=lambda: list(DEFAULT_CAPACITY_ERROR_PATTERNS)
+    )
+    capacity_cooldown_seconds: int = Field(default=90, ge=1)
+    transient_error_patterns: list[str] = Field(
+        default_factory=lambda: list(DEFAULT_TRANSIENT_ERROR_PATTERNS)
+    )
+    stall_stdout_patterns: list[str] = Field(
+        default_factory=lambda: list(DEFAULT_STALL_STDOUT_PATTERNS)
+    )
+    stall_grace_seconds: int = Field(default=30, ge=1)
+    context_file_max_chars: int = Field(default=12000, ge=1)
+    context_files_total_max_chars: int = Field(default=40000, ge=1)
 
     @model_validator(mode="after")
     def _validate_workflow(self) -> WorkflowConfig:
@@ -488,6 +544,16 @@ class WorkflowConfig(BaseModel):
             raise ValueError("transient_retry_delays_seconds entries must be >= 0")
         if any(delay < 0 for delay in self.transport_retry_delays_seconds):
             raise ValueError("transport_retry_delays_seconds entries must be >= 0")
+        for group_name, patterns in (
+            ("capacity_error_patterns", self.capacity_error_patterns),
+            ("transient_error_patterns", self.transient_error_patterns),
+            ("stall_stdout_patterns", self.stall_stdout_patterns),
+        ):
+            for pat in patterns:
+                try:
+                    re.compile(pat)
+                except re.error as exc:
+                    raise ValueError(f"Invalid regex in {group_name} '{pat}': {exc}") from exc
         return self
 
 

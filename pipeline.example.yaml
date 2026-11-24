@@ -70,8 +70,12 @@ providers:
     model: "gemini-4-hydrogen-high"
     output_parser: "plain"
     timeout_seconds: 900
+    # Recommended: 300s (safe with CPU-aware idle checking enabled in v0.2.2+)
     idle_timeout_seconds: 300
     idle_check_process_cpu: true
+    # Optional per-provider override for stalled-agent stdout/stderr detection:
+    # stall_stdout_patterns: ["waiting for \\d+ background task", "root agent idle; waiting for"]
+    # stall_grace_seconds: 30
     anti_laziness: false
     rate_limit_cooldown_seconds: 900
     quota_window_seconds: 18000
@@ -228,6 +232,12 @@ diff_guard:
   readonly_ignore_paths:
     - "go.work.sum"
     - "**/go.work.sum"
+  # Companion lock files automatically allowed in the same directory when a task's allowed_paths permits the manifest
+  paired_paths:
+    "**/pubspec.yaml": ["**/pubspec.lock"]
+    "**/go.mod": ["**/go.sum"]
+    "**/package.json": ["**/package-lock.json", "**/pnpm-lock.yaml", "**/yarn.lock"]
+    "**/Cargo.toml": ["**/Cargo.lock"]
 
 placeholder_guard:
   enabled: true
@@ -288,6 +298,29 @@ workflow:
   review_diff_max_chars: 80000
   # Keep active silent CLI processes alive when process-tree CPU time increases
   idle_check_process_cpu: true
+  # 503 / capacity errors -> short cooldown + immediate fallback without burning task.attempts
+  capacity_error_patterns:
+    - "503"
+    - "UNAVAILABLE"
+    - "No capacity available"
+    - "overloaded"
+    - "Service Unavailable"
+  capacity_cooldown_seconds: 90
+  # 502 / network errors -> free transport_retry with backoff, then fallback when retries exhaust
+  transient_error_patterns:
+    - "502"
+    - "Bad Gateway"
+    - "ECONNRESET"
+    - "ETIMEDOUT"
+    - "socket hang up"
+  # Stalled-agent stdout/stderr detector (kills process tree if no exit or workspace edit within grace window)
+  stall_stdout_patterns:
+    - 'waiting for \d+ background task'
+    - 'root agent idle; waiting for'
+  stall_grace_seconds: 30
+  # Context files prompt budget (prevents oversized context_files from blowing up prompt size)
+  context_file_max_chars: 12000
+  context_files_total_max_chars: 40000
 
 notifications:
   telegram:

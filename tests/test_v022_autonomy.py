@@ -514,7 +514,7 @@ def test_smart_idle_timeout_keeps_silent_cpu_busy_process_alive_and_kills_sleepi
 
 
 def test_v022_version_and_example_config_backward_compatibility() -> None:
-    assert __version__ == "0.2.2"
+    assert tuple(int(part) for part in __version__.split(".")) >= (0, 2, 2)
     example_path = Path(__file__).resolve().parent.parent / "pipeline.example.yaml"
     cfg = load_pipeline_config(example_path)
     assert cfg.workflow.review_diff_max_file_lines == 400

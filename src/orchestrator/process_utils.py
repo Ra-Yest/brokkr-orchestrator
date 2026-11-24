@@ -88,6 +88,8 @@ class ProcessRunResult:
     timed_out: bool
     idle_timed_out: bool = False
     received_meaningful_output: bool = False
+    stall_detected: bool = False
+    stall_reason: str | None = None
 
 
 def resolve_executable(
@@ -402,6 +404,8 @@ def run_noninteractive_process(
     workspace_ignore_dirs: set[str] | frozenset[str] | None = None,
     idle_check_process_cpu: bool = True,
     idle_cpu_min_delta_seconds: float = 0.05,
+    stall_stdout_patterns: list[str] | None = None,
+    stall_grace_seconds: float = 30.0,
 ) -> ProcessRunResult:
     """Run a subprocess in strict non-interactive mode with streaming stdout/stderr and idle/hard timeout."""
     merged_env = dict(os.environ)
@@ -448,6 +452,23 @@ def run_noninteractive_process(
     stderr_chunks: list[str] = []
     last_activity = [start_time]
     received_meaningful = [False]
+    stall_regexes: list[re.Pattern[str]] = [
+        re.compile(pat, re.IGNORECASE) for pat in (stall_stdout_patterns or [])
+    ]
+    stall_detected_at: list[float | None] = [None]
+    stall_matched_pattern: list[str | None] = [None]
+
+    def _check_stall_text(recent_text: str) -> None:
+        if not stall_regexes:
+            return
+        cleaned = strip_ansi(recent_text)
+        for rx in stall_regexes:
+            if rx.search(cleaned):
+                with lock:
+                    if stall_detected_at[0] is None:
+                        stall_detected_at[0] = time.monotonic()
+                        stall_matched_pattern[0] = rx.pattern
+                break
 
     def _write_stdin() -> None:
         if proc.stdin is None or stdin_data is None:
@@ -469,6 +490,7 @@ def run_noninteractive_process(
         if stream is None:
             return
         decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+        recent_tail = ""
         try:
             fd = stream.fileno()  # type: ignore[attr-defined]
         except Exception:
@@ -497,6 +519,10 @@ def run_noninteractive_process(
                             fire_first = True
                     else:
                         stderr_chunks.append(text)
+                if stall_regexes:
+                    combined_window = recent_tail + text
+                    _check_stall_text(combined_window)
+                    recent_tail = combined_window[-256:]
                 if fire_first and on_first_output is not None:
                     with contextlib.suppress(Exception):
                         on_first_output(text)
@@ -518,6 +544,8 @@ def run_noninteractive_process(
                             fire_first_tail = True
                     else:
                         stderr_chunks.append(tail)
+                if stall_regexes:
+                    _check_stall_text(recent_tail + tail)
                 if fire_first_tail and on_first_output is not None:
                     with contextlib.suppress(Exception):
                         on_first_output(tail)
@@ -552,9 +580,10 @@ def run_noninteractive_process(
     )
     last_ws_sig = (
         _workspace_activity_signature(watch_dir, ignore_set)
-        if idle_timeout_seconds is not None
+        if (idle_timeout_seconds is not None or bool(stall_regexes))
         else None
     )
+    stall_baseline_ws_sig: tuple[int, float] | None = None
     last_cpu_seconds = (
         _query_process_tree_cpu_seconds(proc, job)
         if (idle_timeout_seconds is not None and idle_check_process_cpu)
@@ -566,14 +595,17 @@ def run_noninteractive_process(
         if idle_timeout_seconds is not None
         else 1.0
     )
-    poll_interval = (
-        min(0.1, max(0.02, idle_timeout_seconds / 10.0))
-        if idle_timeout_seconds is not None
-        else 0.1
-    )
+    poll_candidates: list[float] = [0.1]
+    if idle_timeout_seconds is not None:
+        poll_candidates.append(max(0.02, idle_timeout_seconds / 10.0))
+    if stall_regexes:
+        poll_candidates.append(max(0.02, stall_grace_seconds / 10.0))
+    poll_interval = min(poll_candidates)
 
     timed_out = False
     idle_timed_out = False
+    stall_detected = False
+    stall_reason: str | None = None
     interrupted = False
     exit_code = -1
 
@@ -591,6 +623,37 @@ def run_noninteractive_process(
                     proc.wait(timeout=5)
                 exit_code = proc.returncode if proc.returncode is not None else -1
                 break
+            if stall_regexes:
+                with lock:
+                    det_at = stall_detected_at[0]
+                    det_pat = stall_matched_pattern[0]
+                if det_at is not None:
+                    if stall_baseline_ws_sig is None:
+                        stall_baseline_ws_sig = _workspace_activity_signature(watch_dir, ignore_set)
+                    if now - det_at >= stall_grace_seconds:
+                        cur_sig = _workspace_activity_signature(watch_dir, ignore_set)
+                        if cur_sig != stall_baseline_ws_sig:
+                            # Workspace changed during grace window -> process resumed real work
+                            stall_baseline_ws_sig = None
+                            last_ws_sig = cur_sig
+                            with lock:
+                                stall_detected_at[0] = None
+                                stall_matched_pattern[0] = None
+                                last_activity[0] = now
+                        else:
+                            timed_out = True
+                            idle_timed_out = True
+                            stall_detected = True
+                            stall_reason = (
+                                f"Stalled agent detected (pattern={det_pat!r}); "
+                                f"process did not exit or modify workspace within "
+                                f"{stall_grace_seconds:g}s grace window"
+                            )
+                            _kill_process_tree(proc, job=job)
+                            with contextlib.suppress(subprocess.TimeoutExpired):
+                                proc.wait(timeout=5)
+                            exit_code = proc.returncode if proc.returncode is not None else -1
+                            break
             if idle_timeout_seconds is not None:
                 if now - last_ws_check >= ws_check_interval:
                     cur_sig = _workspace_activity_signature(watch_dir, ignore_set)
@@ -687,6 +750,8 @@ def run_noninteractive_process(
         timed_out=timed_out,
         idle_timed_out=idle_timed_out,
         received_meaningful_output=meaningful,
+        stall_detected=stall_detected,
+        stall_reason=stall_reason,
     )
 
 

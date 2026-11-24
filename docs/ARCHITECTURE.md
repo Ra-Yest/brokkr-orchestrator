@@ -96,6 +96,11 @@ stateDiagram-v2
   - **Fallback Providers & Hibernation:** On `429` or `quota_max_requests`, compatible `fallback_providers` are tried immediately (`provider_fallback_used`). When all candidates for a role are in cooldown, the runner enters `status = "hibernating"` with `resume_at`, emits `runner_hibernating`, sends a single Telegram alert, polls `control_inbox/` in short ticks (instant `abort`/`resume`), and emits `runner_woke_up` upon waking.
   - **Declarative Proxy Monitor (`proxy_monitor.py`):** Optional `GenericProxyMonitor` configured via `proxy_monitor:` (or an external gitignored `config_file`, e.g. `proxy_monitor.local.yaml`, with `${ENV_VAR}` expansion) supports TCP port probes, JSON status field probes (`route_field`, `last_ok_at_field`, `disabled_field`, `blockers_field`, `transient_error_field`), and regex log tail probes (`ok_patterns`, `transient_patterns`, `fatal_patterns`). It stores sanitized `proxy_health_status` in `state.json`, routes transient route-switching into free `transport_retry`, and immediately pauses with `pause_reason = "proxy_error"` on fatal blockers/service-down without burning retries.
   - **Sequential Account Switching:** Providers configuring `account_group`, `account_profile`, and `switch_command` switch accounts automatically before invocation when `state.active_accounts[group] != profile`, emitting `provider_account_switched` or failing fast on error (`provider_account_switch_failed`).
+- **v0.3.0 Quality & Guard Enhancements:**
+  - **Capacity vs. Transient Error Classification:** `503`/`UNAVAILABLE`/`No capacity available`/`overloaded` (`workflow.capacity_error_patterns`) place the provider on a short cooldown (`capacity_cooldown_seconds`, default 90s) and immediately switch to `fallback_providers` without consuming `task.attempts`. `502`/`Bad Gateway`/`ECONNRESET`/`ETIMEDOUT`/`socket hang up` (`workflow.transient_error_patterns`) trigger free `transport_retry` with backoff and fall back to available `fallback_providers` when retries are exhausted.
+  - **Stalled-Agent Output Detector:** `run_noninteractive_process()` matches `stall_stdout_patterns` (e.g., `waiting for \d+ background task`, `root agent idle; waiting for`) on streaming `stdout`/`stderr`; if the process neither exits nor modifies workspace files within `stall_grace_seconds` (default 30s), it terminates the process tree with `timed_out=True, idle_timed_out=True` and a clear `stall_reason` in metadata/logs.
+  - **Paired Lock-File Paths in Diff Guard:** `diff_guard.paired_paths` automatically permits companion lock files (e.g., `app/pubspec.lock`, `go.sum`, `package-lock.json`, `Cargo.lock`) in the same directory whenever `task.allowed_paths` permits the corresponding manifest, while keeping `zones.red_protected` unconditionally blocked.
+  - **Review Prompt Context & Budget:** `prepare_review_diff()` sorts sections into 4 priority tiers (P1 yellow/schemas -> P2 production code -> P3 tests -> P4 data/fixtures/docs) before applying `review_diff_max_chars`; `PromptBuilder` injects `## DOWNSTREAM CONSUMERS (DO NOT BREAK CONTRACT)` for direct dependent tasks, `## GATE EXECUTION SUMMARY` for review roles, and enforces `context_file_max_chars` / `context_files_total_max_chars` budgets.
 
 ---
 
@@ -135,8 +140,10 @@ providers:
     env:                           # Supports ${VAR} (required), ${VAR:-default} (optional; omitted if ${VAR:-} unset),
       <KEY>: string | { from_env: string, optional: bool, default: string? }
     timeout_seconds: int           # Default: 900
-    idle_timeout_seconds: int?     # Optional stream + workspace mtime + process-tree CPU idle kill timeout
+    idle_timeout_seconds: int?     # Recommended: 300 (CPU-aware stream + workspace mtime idle kill timeout)
     idle_check_process_cpu: bool?  # Optional per-provider override for workflow.idle_check_process_cpu
+    stall_stdout_patterns: [regex]? # Optional per-provider override for workflow.stall_stdout_patterns
+    stall_grace_seconds: int?      # Optional per-provider override for workflow.stall_grace_seconds
     anti_laziness: bool            # Default: false; appends anti_laziness_openai.md to Layer 1 static prefix
     rate_limit_patterns: [regex]
     rate_limit_cooldown_seconds: int  # Default: 900
@@ -179,6 +186,7 @@ diff_guard:
   refactorer_limit: { soft_max_files: int?, soft_max_lines: int?, hard_max_files: int, hard_max_lines: int }
   exclude_from_review: [glob]
   readonly_ignore_paths: [glob]    # Default: ["go.work.sum", "**/go.work.sum"] (ignored & cleaned for read-only roles)
+  paired_paths: { glob: [glob] }   # Companion lock files auto-allowed alongside permitted manifests in the same directory
 
 placeholder_guard:
   enabled: bool
@@ -215,8 +223,15 @@ workflow:
   strict_clean_start: bool
   review_diff_exclude_patterns: [glob]  # Excluded from pre_reviewer/reviewer diff body (still shown in --stat & exclusion list)
   review_diff_max_file_lines: int       # Default: 400 (per-file diff line cap in review prompts)
-  review_diff_max_chars: int            # Default: 80000 (total diff char cap in review prompts)
+  review_diff_max_chars: int            # Default: 80000 (total diff char cap in review prompts, priority-sorted P1..P4)
   idle_check_process_cpu: bool          # Default: true (tracks Windows JobObject/GetProcessTimes or POSIX /proc CPU activity)
+  capacity_error_patterns: [regex]      # Default: ["503", "UNAVAILABLE", "No capacity available", "overloaded", "Service Unavailable"]
+  capacity_cooldown_seconds: int        # Default: 90 (short cooldown before switching to fallback_providers)
+  transient_error_patterns: [regex]     # Default: ["502", "Bad Gateway", "ECONNRESET", "ETIMEDOUT", "socket hang up"]
+  stall_stdout_patterns: [regex]        # Default: ['waiting for \d+ background task', 'root agent idle; waiting for']
+  stall_grace_seconds: int              # Default: 30 (kill hung agent if no exit/file edit within grace window)
+  context_file_max_chars: int           # Default: 12000 (per-file cap in PromptBuilder._render_context_files)
+  context_files_total_max_chars: int    # Default: 40000 (total context_files char budget per prompt)
 
 notifications:
   telegram:

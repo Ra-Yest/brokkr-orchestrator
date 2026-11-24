@@ -31,7 +31,7 @@ from orchestrator.fs_utils import (
     sha256_file,
     snapshot_directory_hashes,
 )
-from orchestrator.gates import GateRunner
+from orchestrator.gates import GateRunner, format_gate_execution_summary
 from orchestrator.git_ops import GitChange, GitOperationError, GitOps
 from orchestrator.models import (
     READ_ONLY_ROLES,
@@ -121,12 +121,18 @@ def classify_provider_failure(
     return "permanent"
 
 
+def _matches_any_pattern(text: str, patterns: list[str]) -> bool:
+    """Return True if any case-insensitive regex in patterns matches text."""
+    return any(re.search(pat, text, re.IGNORECASE) for pat in patterns)
+
+
 def is_transport_failure_before_response(
     response: ProviderResponse,
     *,
     max_duration_seconds: int,
     git_tree_changed: bool,
     proxy_route_switching: bool = False,
+    transient_error_patterns: list[str] | None = None,
 ) -> bool:
     """Return True if the call failed before producing work and qualifies for a free transport retry."""
     if (
@@ -145,6 +151,8 @@ def is_transport_failure_before_response(
     if proxy_route_switching:
         return True
     combined = f"{response.raw_stderr}\n{response.raw_stdout}"
+    if transient_error_patterns and _matches_any_pattern(combined, transient_error_patterns):
+        return True
     if _TRANSIENT_ERROR_RE.search(combined):
         return True
     return (not response.received_meaningful_output) and (
@@ -266,6 +274,7 @@ class OrchestratorRunner:
         self._abort_requested = False
         self._batch_diffs: dict[str, str] = {}
         self._batch_diff_stats: dict[str, str] = {}
+        self._last_gate_summaries: dict[str, str] = {}
         self._attempt_counter: dict[str, int] = {}
         self._last_proxy_key: tuple[str, bool, bool, str | None] | None = None
         self._resumable_needs_review_base_sha: dict[str, str] = {}
@@ -1477,6 +1486,7 @@ class OrchestratorRunner:
         transport_retries = 0
         transient_attempt = 0
         readonly_timeout_retries = 0
+        exhausted_providers: set[str] = set()
 
         while True:
             # Proxy monitor preflight before invoking governed providers
@@ -1547,6 +1557,16 @@ class OrchestratorRunner:
                 if provider.profile.idle_check_process_cpu is not None
                 else self.config.workflow.idle_check_process_cpu
             )
+            stall_patterns = (
+                provider.profile.stall_stdout_patterns
+                if provider.profile.stall_stdout_patterns is not None
+                else self.config.workflow.stall_stdout_patterns
+            )
+            stall_grace = (
+                provider.profile.stall_grace_seconds
+                if provider.profile.stall_grace_seconds is not None
+                else self.config.workflow.stall_grace_seconds
+            )
             request = ProviderRequest(
                 run_id=self.event_bus.run_id,
                 task_id=task_id,
@@ -1559,6 +1579,8 @@ class OrchestratorRunner:
                 timeout_seconds=provider.profile.timeout_seconds,
                 idle_timeout_seconds=provider.profile.idle_timeout_seconds,
                 idle_check_process_cpu=idle_check_cpu,
+                stall_stdout_patterns=stall_patterns,
+                stall_grace_seconds=float(stall_grace),
                 attempt_dir=attempt_dir,
                 on_first_output=_on_first_output,
             )
@@ -1656,6 +1678,64 @@ class OrchestratorRunner:
                 provider = self.registry.get(avail_name)
                 continue
 
+            # 503 / UNAVAILABLE / No capacity available -> short cooldown + immediate fallback without burning attempts
+            combined_output = f"{response.raw_stderr}\n{response.raw_stdout}"
+            is_capacity_error = (
+                response.exit_code != 0
+                and not response.timed_out
+                and not response.idle_timed_out
+                and not tamper_changes
+                and not _PERMANENT_ERROR_RE.search(combined_output)
+                and _matches_any_pattern(
+                    combined_output,
+                    self.config.workflow.capacity_error_patterns,
+                )
+            )
+            if is_capacity_error:
+                cooldown = self.config.workflow.capacity_cooldown_seconds
+                self.event_bus.quota_tracker.record_rate_limit(
+                    provider.name,
+                    cooldown_seconds=cooldown,
+                )
+                self.event_bus.save_state()
+                self.event_bus.emit(
+                    EventType.PROVIDER_RATE_LIMITED,
+                    task_id=task_id,
+                    role=role,
+                    provider=provider.name,
+                    payload={
+                        "cooldown_seconds": cooldown,
+                        "reason": "capacity_error",
+                        "stderr": response.raw_stderr[:400],
+                    },
+                )
+                self._check_control_after_step()
+
+                next_name, next_wait, _ = self._select_available_provider_for_role(
+                    role,
+                    exclude={provider.name, *exhausted_providers},
+                )
+                if (
+                    next_wait == 0
+                    and next_name != provider.name
+                    and next_name not in exhausted_providers
+                ):
+                    prev_name = provider.name
+                    provider = self.registry.get(next_name)
+                    transport_retries = 0
+                    self.event_bus.emit(
+                        EventType.PROVIDER_FALLBACK_USED,
+                        task_id=task_id,
+                        role=role,
+                        provider=provider.name,
+                        payload={
+                            "from_provider": prev_name,
+                            "to_provider": provider.name,
+                            "reason": "capacity_error",
+                        },
+                    )
+                    continue
+
             # Poll proxy monitor after non-zero / timed-out call to classify fatal error vs route switch
             post_proxy: ProxyHealthStatus | None = None
             if response.exit_code != 0 or response.timed_out or response.idle_timed_out:
@@ -1695,6 +1775,7 @@ class OrchestratorRunner:
                 max_duration_seconds=self.config.workflow.transport_failure_max_duration_seconds,
                 git_tree_changed=git_tree_changed,
                 proxy_route_switching=proxy_switching,
+                transient_error_patterns=self.config.workflow.transient_error_patterns,
             )
 
             if transport_fail and max_transport_retries > 0:
@@ -1736,7 +1817,30 @@ class OrchestratorRunner:
                     )
                     continue
 
-                # Exhausted free transport retries without ever getting a model response -> pause
+                # Exhausted transport retries on this provider -> switch to available fallback if any
+                exhausted_providers.add(provider.name)
+                next_name, next_wait, _ = self._select_available_provider_for_role(
+                    role,
+                    exclude=exhausted_providers,
+                )
+                if next_wait == 0 and next_name not in exhausted_providers:
+                    prev_name = provider.name
+                    provider = self.registry.get(next_name)
+                    transport_retries = 0
+                    self.event_bus.emit(
+                        EventType.PROVIDER_FALLBACK_USED,
+                        task_id=task_id,
+                        role=role,
+                        provider=provider.name,
+                        payload={
+                            "from_provider": prev_name,
+                            "to_provider": provider.name,
+                            "reason": "transport_retry_exhausted",
+                        },
+                    )
+                    continue
+
+                # Exhausted free transport retries across all available providers -> pause
                 # without burning QuotaTracker, task.attempts, or review_rounds.
                 raise _PausedByInfraError(
                     reason=(
@@ -1967,17 +2071,21 @@ class OrchestratorRunner:
                 },
             )
         else:
+            fail_payload: dict[str, Any] = {
+                "exit_code": response.exit_code,
+                "timed_out": response.timed_out,
+                "idle_timed_out": response.idle_timed_out,
+                "stderr_tail": response.raw_stderr[-400:],
+            }
+            if response.metadata.get("stall_detected"):
+                fail_payload["stall_detected"] = True
+                fail_payload["stall_reason"] = response.metadata.get("stall_reason")
             self.event_bus.emit(
                 EventType.PROVIDER_FAILED,
                 task_id=task_id,
                 role=role,
                 provider=provider.name,
-                payload={
-                    "exit_code": response.exit_code,
-                    "timed_out": response.timed_out,
-                    "idle_timed_out": response.idle_timed_out,
-                    "stderr_tail": response.raw_stderr[-400:],
-                },
+                payload=fail_payload,
             )
 
         return response, guard_report
@@ -2041,6 +2149,10 @@ class OrchestratorRunner:
         if complexity == TaskComplexity.HARD:
             return AgentRole.WORKER_HARD
         return AgentRole.WORKER_MEDIUM
+
+    def _get_downstream_tasks(self, task_id: str) -> list[Task]:
+        """Return direct downstream tasks that depend on task_id."""
+        return [t for t in self.store.list_tasks() if task_id in t.depends_on]
 
     def _transition_task(self, task_id: str, status: TaskStatus, **fields: Any) -> Task:
         prev = self.store.get_task(task_id).status
@@ -2137,6 +2249,7 @@ class OrchestratorRunner:
                     repo_map_text=repo_map_text,
                     progress_text=progress_text,
                     task=task,
+                    downstream_tasks=self._get_downstream_tasks(task.id),
                     inbox_text=inbox_text,
                     gate_error_log=gate_error_log,
                     guard_error_text=guard_error_text,
@@ -2253,10 +2366,15 @@ class OrchestratorRunner:
                             ),
                         )
                         return True
+                    stall_note = (
+                        f" Reason: {response.metadata['stall_reason']}."
+                        if response.metadata.get("stall_reason")
+                        else ""
+                    )
                     guard_error_text = (
                         f"Provider execution failed (exit_code={response.exit_code}, "
-                        f"timed_out={response.timed_out}, idle_timed_out={response.idle_timed_out}). "
-                        f"Fix and complete the task.\n"
+                        f"timed_out={response.timed_out}, idle_timed_out={response.idle_timed_out})."
+                        f"{stall_note} Fix and complete the task.\n"
                         f"{response.raw_stderr[-500:]}"
                     )
                     task = self._transition_task(task.id, TaskStatus.GATES_FAILED)
@@ -2363,6 +2481,11 @@ class OrchestratorRunner:
                         "gates": [r.name for r in gates_res.results],
                         "screenshots": gates_res.screenshots,
                     },
+                )
+                self._last_gate_summaries[task.id] = format_gate_execution_summary(
+                    gates_res,
+                    configured_gates=self.config.gates,
+                    verify_cmd=task.verify_cmd,
                 )
                 gates_passed_this_round = True
                 break
@@ -2475,6 +2598,7 @@ class OrchestratorRunner:
                 progress_note=pending_progress_note,
                 repo_map_text=repo_map_text,
                 soft_warning_note=soft_warning_note,
+                gate_summary=self._last_gate_summaries.get(task.id),
                 on_reject_status=TaskStatus.IN_PROGRESS,
             )
             if outcome != "rejected":
@@ -2492,6 +2616,7 @@ class OrchestratorRunner:
         progress_note: str,
         repo_map_text: str,
         soft_warning_note: str | None,
+        gate_summary: str | None = None,
         on_reject_status: TaskStatus,
     ) -> tuple[Literal["done", "failed_or_split", "rejected"], Task, str | None]:
         """Run pre_reviewer (unless already approved) and Master reviewer for a NEEDS_REVIEW task."""
@@ -2510,6 +2635,7 @@ class OrchestratorRunner:
                 base_sha=task_base_sha,
                 repo_map_text=repo_map_text,
                 soft_warning_note=soft_warning_note,
+                gate_summary=gate_summary,
             )
             self._check_control_after_step()
             if not pre_ok:
@@ -2555,6 +2681,7 @@ class OrchestratorRunner:
             base_sha=task_base_sha,
             repo_map_text=repo_map_text,
             soft_warning_note=soft_warning_note,
+            gate_summary=gate_summary,
         )
         self._check_control_after_step()
 
@@ -2694,6 +2821,7 @@ class OrchestratorRunner:
             progress_note=progress_note,
             repo_map_text=repo_map_text,
             soft_warning_note=soft_warning_note,
+            gate_summary=self._last_gate_summaries.get(task.id),
             on_reject_status=TaskStatus.TODO,
         )
         return outcome != "rejected"
@@ -2708,6 +2836,7 @@ class OrchestratorRunner:
         base_sha: str,
         repo_map_text: str,
         soft_warning_note: str | None = None,
+        gate_summary: str | None = None,
     ) -> tuple[bool, str]:
         _, attempt_dir = self._next_attempt_dir(f"{task.id}_{role.value}")
         profile = self.registry.for_role(role).profile
@@ -2720,9 +2849,11 @@ class OrchestratorRunner:
             repo_map_text=repo_map_text,
             progress_text=self._read_progress_text(),
             task=task,
+            downstream_tasks=self._get_downstream_tasks(task.id),
             filtered_diff=review_diff_input,
             diff_stat=diff_stat,
             last_report=last_report,
+            gate_summary=gate_summary,
             extra_instructions=soft_warning_note,
         )
         response, guard_report = self._invoke_provider_guarded(

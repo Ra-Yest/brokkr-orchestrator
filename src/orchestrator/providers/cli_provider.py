@@ -10,7 +10,11 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
-from orchestrator.config import ProviderProfileConfig, resolve_env_map
+from orchestrator.config import (
+    DEFAULT_STALL_STDOUT_PATTERNS,
+    ProviderProfileConfig,
+    resolve_env_map,
+)
 from orchestrator.process_utils import resolve_executable, run_noninteractive_process
 from orchestrator.providers.base import BaseAgentProvider, ProviderRequest, ProviderResponse
 
@@ -187,6 +191,24 @@ class CliAgentProvider(BaseAgentProvider):
             if self.profile.idle_check_process_cpu is not None
             else request.idle_check_process_cpu
         )
+        stall_patterns = (
+            self.profile.stall_stdout_patterns
+            if self.profile.stall_stdout_patterns is not None
+            else (
+                request.stall_stdout_patterns
+                if request.stall_stdout_patterns is not None
+                else list(DEFAULT_STALL_STDOUT_PATTERNS)
+            )
+        )
+        stall_grace: float = (
+            float(self.profile.stall_grace_seconds)
+            if self.profile.stall_grace_seconds is not None
+            else (
+                float(request.stall_grace_seconds)
+                if request.stall_grace_seconds is not None
+                else 30.0
+            )
+        )
 
         # Store temporary prompt/output files strictly outside the target repo and .pipeline/
         with tempfile.TemporaryDirectory(prefix="orch_cli_") as tmp_dir_str:
@@ -219,6 +241,8 @@ class CliAgentProvider(BaseAgentProvider):
                 on_first_output=request.on_first_output,
                 workspace_watch_dir=request.workdir,
                 idle_check_process_cpu=idle_check_cpu,
+                stall_stdout_patterns=stall_patterns,
+                stall_grace_seconds=stall_grace,
             )
 
             file_output = ""
@@ -248,6 +272,8 @@ class CliAgentProvider(BaseAgentProvider):
                 "prompt_mode": self.profile.prompt_mode,
                 "used_output_file": bool(file_output.strip()),
                 "idle_timed_out": proc_res.idle_timed_out,
+                "stall_detected": proc_res.stall_detected,
+                **({"stall_reason": proc_res.stall_reason} if proc_res.stall_reason else {}),
             },
         )
 

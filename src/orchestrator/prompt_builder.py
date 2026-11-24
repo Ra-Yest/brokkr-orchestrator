@@ -41,6 +41,93 @@ class PreparedReviewDiff:
     truncated_total: bool = False
 
 
+_SCHEMA_API_DIRS: frozenset[str] = frozenset(
+    {
+        "schema",
+        "schemas",
+        "contract",
+        "contracts",
+        "api",
+        "apis",
+        "openapi",
+        "proto",
+        "protos",
+        "migrations",
+        "db",
+    }
+)
+_LOW_PRIORITY_DIRS: frozenset[str] = frozenset(
+    {
+        "docs",
+        "doc",
+        "fixtures",
+        "fixture",
+        "testdata",
+        "mock_data",
+        "snapshots",
+        "assets",
+        "data",
+        "examples",
+        "samples",
+    }
+)
+_LOW_PRIORITY_EXTS: tuple[str, ...] = (
+    ".md",
+    ".rst",
+    ".txt",
+    ".json",
+    ".yaml",
+    ".yml",
+    ".toml",
+    ".ini",
+    ".cfg",
+    ".csv",
+    ".xml",
+    ".properties",
+)
+
+
+def _classify_review_diff_priority(
+    path: str,
+    *,
+    yellow_patterns: list[str] | None = None,
+    test_patterns: list[str] | None = None,
+) -> int:
+    """Classify a diff file into 4 review priority tiers (1=highest, 4=lowest).
+
+    P1: yellow_shared files and schemas/contracts (*.proto, *.sql, *schema*/*contract*, or
+        *.json/*.yaml/*.yml under schema/API roots).
+    P2: main production source code.
+    P3: test files matching zones.test_patterns.
+    P4: other data, config, fixture, and documentation files.
+    """
+    norm = path.replace("\\", "/").lstrip("./")
+    lower = norm.lower()
+    parts = set(lower.split("/"))
+    basename = lower.rsplit("/", 1)[-1]
+
+    if yellow_patterns and matches_any_glob(norm, yellow_patterns):
+        return 1
+
+    is_test = bool(test_patterns and matches_any_glob(norm, test_patterns))
+    if not is_test:
+        if basename.endswith((".proto", ".sql")):
+            return 1
+        if not (parts & _LOW_PRIORITY_DIRS):
+            if "schema" in basename or "contract" in basename or "openapi" in basename:
+                return 1
+            if basename.endswith((".json", ".yaml", ".yml")) and (parts & _SCHEMA_API_DIRS):
+                return 1
+
+    if is_test:
+        return 3
+
+    if (parts & _LOW_PRIORITY_DIRS) or basename.endswith(_LOW_PRIORITY_EXTS):
+        return 4
+
+    return 2
+
+
 def prepare_review_diff(
     raw_diff: str,
     *,
@@ -48,6 +135,8 @@ def prepare_review_diff(
     exclude_patterns: list[str] | None = None,
     max_file_lines: int = 400,
     max_chars: int = 80000,
+    yellow_patterns: list[str] | None = None,
+    test_patterns: list[str] | None = None,
 ) -> PreparedReviewDiff:
     """Filter, per-file line-truncate, and cap total chars of a git diff for review prompts."""
     norm_stat = normalize_newlines(diff_stat).strip()
@@ -103,6 +192,16 @@ def prepare_review_diff(
             kept_sections.append((path, trimmed))
         else:
             kept_sections.append((path, section if section.endswith("\n") else section + "\n"))
+
+    # Prioritize P1 (yellow/schemas) -> P2 (production) -> P3 (tests) -> P4 (data/fixtures/docs)
+    # before applying the total review_diff_max_chars cap (stable sort preserves order within tier).
+    kept_sections.sort(
+        key=lambda item: _classify_review_diff_priority(
+            item[0],
+            yellow_patterns=yellow_patterns,
+            test_patterns=test_patterns,
+        )
+    )
 
     # Track character spans per kept file so we can report files affected by max_chars truncation
     assembled_parts: list[str] = []
@@ -254,6 +353,8 @@ class PromptBuilder:
             return ""
         # Deduplicate while keeping deterministic sorted order
         unique_paths = sorted({p.replace("\\", "/") for p in context_files if p.strip()})
+        per_file_max = self.config.workflow.context_file_max_chars
+        remaining_budget = self.config.workflow.context_files_total_max_chars
         blocks: list[str] = ["## CONTEXT FILES"]
         for rel in unique_paths:
             full = (self.repo_root / rel).resolve()
@@ -264,10 +365,58 @@ class PromptBuilder:
                 continue
             if full.exists() and full.is_file():
                 content = normalize_newlines(full.read_text(encoding="utf-8", errors="replace"))
-                blocks.append(f"### {rel}\n```\n{content}\n```")
+                if remaining_budget <= 0:
+                    blocks.append(
+                        f"### {rel}\n[truncated {len(content)} chars; read full file if needed]"
+                    )
+                    continue
+                allowed_chars = min(per_file_max, remaining_budget)
+                if len(content) > allowed_chars:
+                    omitted = len(content) - allowed_chars
+                    clipped = content[:allowed_chars]
+                    remaining_budget -= len(clipped)
+                    blocks.append(
+                        f"### {rel}\n```\n{clipped}\n```\n"
+                        f"[truncated {omitted} chars; read full file if needed]"
+                    )
+                else:
+                    remaining_budget -= len(content)
+                    blocks.append(f"### {rel}\n```\n{content}\n```")
             else:
                 blocks.append(f"### {rel}\n(file does not exist yet)")
         return "\n\n".join(blocks)
+
+    def _render_downstream_consumers(
+        self,
+        downstream_tasks: list[Task],
+        *,
+        max_chars: int = 800,
+    ) -> str:
+        if not downstream_tasks:
+            return ""
+        ordered = sorted(downstream_tasks, key=lambda t: t.id)
+        entries: list[str] = []
+        for dt in ordered:
+            parts = [f"- **#{dt.id}: {dt.title}**"]
+            if dt.allowed_paths:
+                paths_str = ", ".join(dt.allowed_paths[:4])
+                if len(dt.allowed_paths) > 4:
+                    paths_str += ", ..."
+                parts.append(f"  - Allowed paths: {paths_str}")
+            if dt.acceptance_criteria:
+                key_criteria = "; ".join(c.strip() for c in dt.acceptance_criteria[:2] if c.strip())
+                if key_criteria:
+                    parts.append(f"  - Key criteria: {key_criteria}")
+            entries.append("\n".join(parts))
+
+        body = "\n".join(entries)
+        if len(body) > max_chars:
+            suffix = "\n... [additional downstream consumers truncated]"
+            if max_chars <= len(suffix):
+                body = body[:max_chars]
+            else:
+                body = body[: max_chars - len(suffix)].rstrip() + suffix
+        return f"## DOWNSTREAM CONSUMERS (DO NOT BREAK CONTRACT)\n\n{body}"
 
     def _render_task_card(self, task: Task) -> str:
         lines = [
@@ -312,9 +461,11 @@ class PromptBuilder:
         diff_stat: str | None = None,
         batch_diff_stats: dict[str, str] | None = None,
         gate_error_log: str | None = None,
+        gate_summary: str | None = None,
         guard_error_text: str | None = None,
         review_feedback: str | None = None,
         last_report: str | None = None,
+        downstream_tasks: list[Task] | None = None,
         escalation_context: str | None = None,
         extra_instructions: str | None = None,
     ) -> BuiltPrompt:
@@ -341,6 +492,8 @@ class PromptBuilder:
                 exclude_patterns=review_excludes,
                 max_file_lines=review_max_lines,
                 max_chars=review_max_chars,
+                yellow_patterns=self.config.zones.yellow_shared,
+                test_patterns=self.config.zones.test_patterns,
             )
 
         dynamic_sections: list[str] = []
@@ -361,6 +514,10 @@ class PromptBuilder:
 
         if task is not None:
             dynamic_sections.append(f"## ACTIVE TASK\n\n{self._render_task_card(task)}")
+            if downstream_tasks:
+                downstream_block = self._render_downstream_consumers(downstream_tasks)
+                if downstream_block:
+                    dynamic_sections.append(downstream_block)
             ctx_block = self._render_context_files(task.context_files)
             if ctx_block:
                 dynamic_sections.append(ctx_block)
@@ -384,6 +541,8 @@ class PromptBuilder:
                         exclude_patterns=review_excludes,
                         max_file_lines=review_max_lines,
                         max_chars=per_item_chars,
+                        yellow_patterns=self.config.zones.yellow_shared,
+                        test_patterns=self.config.zones.test_patterns,
                     )
                     if b_prepared.diff_stat:
                         item_parts.append(
@@ -427,6 +586,11 @@ class PromptBuilder:
         if last_report and last_report.strip():
             dynamic_sections.append(
                 f"## WORKER REPORT (last_report.md)\n\n{normalize_newlines(last_report).strip()}"
+            )
+
+        if gate_summary and gate_summary.strip():
+            dynamic_sections.append(
+                f"## GATE EXECUTION SUMMARY\n\n{normalize_newlines(gate_summary).strip()}"
             )
 
         if prepared_single is not None:

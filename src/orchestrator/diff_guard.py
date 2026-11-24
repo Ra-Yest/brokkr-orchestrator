@@ -322,6 +322,35 @@ def scan_placeholders(
     return violations
 
 
+def _is_path_allowed(
+    rel_path: str,
+    task_allowed: list[str],
+    paired_paths: dict[str, list[str]] | None = None,
+) -> bool:
+    """Return True if rel_path matches task_allowed or is a paired lock/manifest in the same directory."""
+    if matches_any_glob(rel_path, task_allowed):
+        return True
+    if not paired_paths:
+        return False
+
+    norm = _normalize_rel_path(rel_path)
+    dir_prefix = norm.rsplit("/", 1)[0] if "/" in norm else ""
+
+    for manifest_glob, companion_globs in paired_paths.items():
+        if not matches_any_glob(norm, companion_globs):
+            continue
+        norm_manifest_glob = _normalize_rel_path(manifest_glob)
+        manifest_basename = norm_manifest_glob.rsplit("/", 1)[-1]
+        if not manifest_basename or any(ch in manifest_basename for ch in ("*", "?", "[")):
+            continue
+        sibling_manifest = f"{dir_prefix}/{manifest_basename}" if dir_prefix else manifest_basename
+        if matches_any_glob(sibling_manifest, [norm_manifest_glob]) and matches_any_glob(
+            sibling_manifest, task_allowed
+        ):
+            return True
+    return False
+
+
 def _resolve_diff_limit(
     role: AgentRole,
     config: PipelineConfig,
@@ -408,6 +437,7 @@ def evaluate_diff(
     zones = config.zones
     is_architect_role = role in ARCHITECT_ROLES
     task_allowed = allowed_paths or []
+    paired_paths = config.diff_guard.paired_paths
 
     # 2. Three-zone policy per changed file
     for change in changes:
@@ -446,7 +476,7 @@ def evaluate_diff(
             if (
                 not is_architect_role
                 and task_allowed
-                and not matches_any_glob(change.path, task_allowed)
+                and not _is_path_allowed(change.path, task_allowed, paired_paths)
             ):
                 scope_violations.append(
                     GuardViolation(
@@ -469,7 +499,7 @@ def evaluate_diff(
                 zones.enforce_allowed_paths_on_yellow
                 and not is_architect_role
                 and task_allowed
-                and not matches_any_glob(change.path, task_allowed)
+                and not _is_path_allowed(change.path, task_allowed, paired_paths)
             ):
                 scope_violations.append(
                     GuardViolation(
@@ -488,7 +518,7 @@ def evaluate_diff(
         if (
             not is_architect_role
             and task_allowed
-            and not matches_any_glob(change.path, task_allowed)
+            and not _is_path_allowed(change.path, task_allowed, paired_paths)
         ):
             scope_violations.append(
                 GuardViolation(
