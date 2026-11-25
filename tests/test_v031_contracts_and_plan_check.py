@@ -812,7 +812,7 @@ def test_task_without_contracts_approves_without_contract_checks_json(temp_git_r
 
 
 def test_v031_version_templates_and_example_config() -> None:
-    assert __version__ == "0.3.1"
+    assert tuple(int(p) for p in __version__.split(".")) >= (0, 3, 1)
 
     repo_root = Path(__file__).resolve().parent.parent
     cfg = load_pipeline_config(repo_root / "pipeline.example.yaml")

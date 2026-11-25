@@ -1,4 +1,4 @@
-"""CLI entry point for the AFK Orchestrator (`init`, `doctor`, `plan-check`, `run`, `status`, `control`, `report`)."""
+"""CLI entry point for the AFK Orchestrator (`init`, `doctor`, `plan-check`, `run`, `status`, `stats`, `control`, `report`)."""
 
 from __future__ import annotations
 
@@ -24,6 +24,7 @@ from orchestrator.providers.base import ProviderRegistry
 from orchestrator.proxy_monitor import build_proxy_monitor
 from orchestrator.reporter import write_report
 from orchestrator.runner import OrchestratorRunner
+from orchestrator.stats import compute_pipeline_stats, format_stats_console
 from orchestrator.stores.local_json import LocalJsonTaskStore
 
 
@@ -934,6 +935,22 @@ def cmd_report(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_stats(args: argparse.Namespace) -> int:
+    repo_root = Path(args.repo).resolve()
+    config_path = _default_config_path(repo_root, args.config)
+    pipeline_dir = (
+        load_pipeline_config(config_path).pipeline_path(repo_root)
+        if config_path.exists()
+        else (repo_root / ".pipeline")
+    )
+    stats = compute_pipeline_stats(pipeline_dir / "events.jsonl")
+    if args.as_json:
+        print(json.dumps(stats.model_dump(mode="json"), indent=2, ensure_ascii=False))
+    else:
+        print(format_stats_console(stats))
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="orchestrator",
@@ -1020,6 +1037,17 @@ def build_parser() -> argparse.ArgumentParser:
     p_rep.add_argument("--repo", default=".", help="Path to target git repository")
     p_rep.add_argument("--config", default=None, help="Path to pipeline.yaml")
     p_rep.set_defaults(func=cmd_report)
+
+    p_stats = sub.add_parser("stats", help="Display aggregated pipeline telemetry from events.jsonl")
+    p_stats.add_argument("--repo", default=".", help="Path to target git repository")
+    p_stats.add_argument("--config", default=None, help="Path to pipeline.yaml")
+    p_stats.add_argument(
+        "--json",
+        dest="as_json",
+        action="store_true",
+        help="Output machine-readable JSON telemetry",
+    )
+    p_stats.set_defaults(func=cmd_stats)
 
     return parser
 

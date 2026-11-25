@@ -181,6 +181,14 @@ class GitOps:
         )
         return res.stdout if res.exit_code == 0 else ""
 
+    def get_commit_diff(self, commit_sha: str) -> str:
+        """Return unified diff (`git show --format=`) for a single commit."""
+        res = self._run(
+            ["show", "--format=", "--no-ext-diff", "--no-color", commit_sha],
+            check=False,
+        )
+        return res.stdout if res.exit_code == 0 else ""
+
     def commit_all(self, message: str, *, exclude_pipeline_dir: bool = True) -> str:
         """Stage all non-ignored repository changes (excluding pipeline_dir) and commit."""
         self._run(["add", "-A"])

@@ -309,11 +309,14 @@ class RoleMappingConfig(BaseModel):
     worker_hard: str
     pre_reviewer: str
     reviewer: str
+    seam_auditor: str | None = None
     architect: str
     refactorer: str
     role_prompt_files: dict[str, str] = Field(default_factory=dict)
 
     def profile_for_role(self, role: AgentRole) -> str:
+        if role == AgentRole.SEAM_AUDITOR:
+            return self.seam_auditor if self.seam_auditor is not None else self.reviewer
         value: str = getattr(self, role.value)
         return value
 
@@ -538,6 +541,9 @@ class WorkflowConfig(BaseModel):
     stall_grace_seconds: int = Field(default=30, ge=1)
     context_file_max_chars: int = Field(default=12000, ge=1)
     context_files_total_max_chars: int = Field(default=40000, ge=1)
+    seam_audit_enabled: bool = True
+    seam_audit_pause_on_critical: bool = True
+    seam_audit_max_chars: int = Field(default=40000, ge=1)
 
     @model_validator(mode="after")
     def _validate_workflow(self) -> WorkflowConfig:
@@ -714,6 +720,13 @@ class PipelineConfig(BaseModel):
                 raise ValueError(
                     f"Writing role '{role.value}' cannot use provider profile '{profile_name}' "
                     f"because can_edit_files is False"
+                )
+        if self.roles.seam_auditor is not None:
+            seam_profile = self.providers[self.roles.seam_auditor]
+            if seam_profile.can_edit_files:
+                raise ValueError(
+                    f"Read-only role 'seam_auditor' cannot use provider profile "
+                    f"'{self.roles.seam_auditor}' because can_edit_files is True"
                 )
         for profile_name, profile in self.providers.items():
             for fb_name in profile.fallback_providers:

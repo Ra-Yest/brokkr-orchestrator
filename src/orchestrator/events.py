@@ -288,6 +288,14 @@ def format_console_event(event: PipelineEvent) -> str | None:
         reason = f" ({p.get('reason')})" if p.get("reason") else ""
         return f"[{ts}] review_completed {task_tag}verdict={p.get('verdict')}{reason}"
 
+    if et == EventType.SEAM_AUDIT_COMPLETED:
+        return (
+            f"[{ts}] seam_audit_completed {task_tag}"
+            f"contract={p.get('contract_id', '?')} "
+            f"{p.get('producer_id', '?')}->{p.get('consumer_id', '?')} "
+            f"verdict={p.get('verdict', '?')} findings={p.get('findings_count', 0)}"
+        )
+
     if et == EventType.BATCH_REVIEW_STARTED:
         tids = p.get("task_ids")
         joined = ",".join(str(t) for t in tids) if isinstance(tids, list) else ""
@@ -441,6 +449,7 @@ class EventBus:
             provider_quotas=dict(self.quota_tracker.quotas),
             active_accounts=dict(previous_state.active_accounts) if previous_state else {},
             proxy_health_status=previous_state.proxy_health_status if previous_state else None,
+            audited_seams=list(previous_state.audited_seams) if previous_state else [],
         )
         if not defer_save:
             self.save_state()

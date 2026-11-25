@@ -57,6 +57,7 @@ from orchestrator.notifications import BaseNotifier, build_notifier
 from orchestrator.output_parser import (
     parse_batch_review_verdicts,
     parse_planner_subtasks,
+    parse_seam_audit_output,
     parse_single_review_verdict,
     parse_worker_output,
 )
@@ -479,9 +480,10 @@ class OrchestratorRunner:
             return RunStatus.COMPLETED
 
         except _PausedByInfraError as exc:
+            is_seam_pause = exc.pause_reason == "seam_audit_critical"
             self.event_bus.update_state(
                 status=RunStatus.PAUSED,
-                active_phase="paused_infra",
+                active_phase="paused_seam_audit" if is_seam_pause else "paused_infra",
                 paused=True,
                 pause_reason=exc.pause_reason,
                 resume_at=None,
@@ -494,11 +496,17 @@ class OrchestratorRunner:
                 payload={"reason": exc.pause_reason, "details": exc.reason},
             )
             self._generate_report()
-            self.notifier.notify(
-                "pause",
-                f"Pipeline Paused on Provider Error ({self.config.project.name})",
-                f"Run {self.event_bus.run_id} paused without reverting approved/pending code: {exc.reason}",
+            notify_title = (
+                f"Pipeline Paused: Critical Seam Audit ({self.config.project.name})"
+                if is_seam_pause
+                else f"Pipeline Paused on Provider Error ({self.config.project.name})"
             )
+            notify_body = (
+                f"Run {self.event_bus.run_id} paused after critical seam audit finding: {exc.reason}"
+                if is_seam_pause
+                else f"Run {self.event_bus.run_id} paused without reverting approved/pending code: {exc.reason}"
+            )
+            self.notifier.notify("pause", notify_title, notify_body)
             return RunStatus.PAUSED
 
         except _AbortedByControlError:
@@ -1623,7 +1631,11 @@ class OrchestratorRunner:
                     task_id=task_id,
                     role=role,
                     provider=provider.name,
-                    payload={"cooldown_seconds": cooldown, "stderr": response.raw_stderr[:400]},
+                    payload={
+                        "cooldown_seconds": cooldown,
+                        "duration_seconds": round(response.duration_seconds, 2),
+                        "stderr": response.raw_stderr[:400],
+                    },
                 )
                 self._check_control_after_step()
 
@@ -1707,6 +1719,7 @@ class OrchestratorRunner:
                     provider=provider.name,
                     payload={
                         "cooldown_seconds": cooldown,
+                        "duration_seconds": round(response.duration_seconds, 2),
                         "reason": "capacity_error",
                         "stderr": response.raw_stderr[:400],
                     },
@@ -2077,6 +2090,7 @@ class OrchestratorRunner:
                 "exit_code": response.exit_code,
                 "timed_out": response.timed_out,
                 "idle_timed_out": response.idle_timed_out,
+                "duration_seconds": round(response.duration_seconds, 2),
                 "stderr_tail": response.raw_stderr[-400:],
             }
             if response.metadata.get("stall_detected"):
@@ -2788,6 +2802,7 @@ class OrchestratorRunner:
                 f"Task Done #{task.id} ({self.config.project.name})",
                 f"{task.title}\nProgress: {done_count}/{total_active}{sha_part}",
             )
+            self._run_seam_audits_for_consumer(task)
             return "done", task, None
 
         # Rejected by Master
@@ -3200,6 +3215,214 @@ class OrchestratorRunner:
                 f"Task Failed #{failed_task.id} ({self.config.project.name})",
                 f"{failed_task.title}\nReason: {fail_reason[:300]}{blocked_line}",
             )
+
+        for approved_task in approved_tasks:
+            refreshed = self.store.get_task(approved_task.id)
+            self._run_seam_audits_for_consumer(refreshed)
+
+    # -------------------------------------------------------------------------
+    # Pairwise Seam Audit at Contract Closure Points (v0.3.2)
+    # -------------------------------------------------------------------------
+
+    @staticmethod
+    def _sanitize_seam_token(token: str) -> str:
+        cleaned = re.sub(r"[^A-Za-z0-9_.-]+", "_", token.strip())
+        return cleaned or "unknown"
+
+    def _collect_seam_fallback_files(
+        self,
+        *,
+        surface: str,
+        changed_files: list[str],
+    ) -> dict[str, str]:
+        candidates: list[str] = []
+        if surface.strip():
+            raw_path = surface.strip().split(":", 1)[0].strip()
+            if raw_path and " " not in raw_path:
+                candidates.append(raw_path.replace("\\", "/"))
+        for fp in changed_files:
+            norm = fp.replace("\\", "/")
+            if norm not in candidates:
+                candidates.append(norm)
+
+        contents: dict[str, str] = {}
+        for rel in candidates:
+            full = (self.repo_root / rel).resolve()
+            try:
+                full.relative_to(self.repo_root)
+            except ValueError:
+                continue
+            if full.is_file():
+                contents[rel] = normalize_newlines(full.read_text(encoding="utf-8", errors="replace"))
+        return contents
+
+    def _run_seam_audits_for_consumer(self, consumer: Task) -> None:
+        """Run read-only pairwise seam audits when a committed consumer closes a contract."""
+        if not self.config.workflow.seam_audit_enabled:
+            return
+        if not consumer.consumes:
+            return
+        contracts = self.store.list_contracts()
+        if not contracts:
+            return
+
+        done_tasks = [
+            t
+            for t in self.store.list_tasks()
+            if t.status == TaskStatus.DONE and t.resolution != "split"
+        ]
+
+        for contract_id in consumer.consumes:
+            spec = contracts.get(contract_id)
+            if spec is None:
+                continue
+            producers = [
+                t
+                for t in done_tasks
+                if t.id != consumer.id and contract_id in t.provides
+            ]
+            for producer in producers:
+                seam_key = f"{contract_id}:{producer.id}:{consumer.id}"
+                if seam_key in self.event_bus.state.audited_seams:
+                    continue
+
+                producer_diff = (
+                    self.git_ops.get_commit_diff(producer.final_commit_sha)
+                    if producer.final_commit_sha
+                    else ""
+                )
+                consumer_diff = (
+                    self.git_ops.get_commit_diff(consumer.final_commit_sha)
+                    if consumer.final_commit_sha
+                    else ""
+                )
+                producer_files = (
+                    None
+                    if producer_diff.strip()
+                    else self._collect_seam_fallback_files(
+                        surface=spec.surface,
+                        changed_files=producer.changed_files,
+                    )
+                )
+                consumer_files = (
+                    None
+                    if consumer_diff.strip()
+                    else self._collect_seam_fallback_files(
+                        surface=spec.surface,
+                        changed_files=consumer.changed_files,
+                    )
+                )
+
+                safe_cid = self._sanitize_seam_token(contract_id)
+                safe_prod = self._sanitize_seam_token(producer.id)
+                safe_cons = self._sanitize_seam_token(consumer.id)
+                _, attempt_dir = self._next_attempt_dir(
+                    f"{consumer.id}_seam_audit_{safe_cid}_{safe_prod}"
+                )
+                auditor_profile = self.registry.for_role(AgentRole.SEAM_AUDITOR).profile
+                built_prompt = self.prompt_builder.build_seam_audit_prompt(
+                    profile=auditor_profile,
+                    repo_map_text=self._refresh_repo_map(),
+                    progress_text=self._read_progress_text(),
+                    contract_id=contract_id,
+                    contract=spec,
+                    producer=producer,
+                    consumer=consumer,
+                    producer_diff=producer_diff,
+                    consumer_diff=consumer_diff,
+                    producer_files=producer_files,
+                    consumer_files=consumer_files,
+                )
+
+                base_sha = self.git_ops.get_head_sha()
+                response, guard_report = self._invoke_provider_guarded(
+                    role=AgentRole.SEAM_AUDITOR,
+                    built_prompt=built_prompt,
+                    task_id=consumer.id,
+                    attempt_dir=attempt_dir,
+                    base_sha=base_sha,
+                )
+                if not guard_report.passed:
+                    self.event_bus.emit(
+                        EventType.RED_ZONE_VIOLATION,
+                        task_id=consumer.id,
+                        role=AgentRole.SEAM_AUDITOR,
+                        provider=response.provider_name,
+                        payload={
+                            "reason": "read_only_role_modified_files",
+                            "seam_key": seam_key,
+                            "details": guard_report.summary_text(),
+                        },
+                    )
+                    self.git_ops.hard_rollback(base_sha)
+                    raise OrchestratorFatalError(
+                        f"Read-only role '{AgentRole.SEAM_AUDITOR.value}' modified repository files "
+                        f"during seam audit of {seam_key}: {guard_report.summary_text()}"
+                    )
+
+                if response.exit_code != 0 or response.timed_out:
+                    raise _PausedByInfraError(
+                        reason=(
+                            f"seam_auditor provider '{response.provider_name}' failed on {seam_key} "
+                            f"(exit_code={response.exit_code}, timed_out={response.timed_out})"
+                        ),
+                        task_id=consumer.id,
+                        role=AgentRole.SEAM_AUDITOR,
+                        provider=response.provider_name,
+                    )
+
+                audit_output = parse_seam_audit_output(response.parsed_text)
+                report_path = (
+                    self.pipeline_dir
+                    / "seam_audits"
+                    / f"{safe_cid}__{safe_prod}__{safe_cons}.json"
+                )
+                atomic_write_json(
+                    report_path,
+                    {
+                        "seam_key": seam_key,
+                        "contract_id": contract_id,
+                        "producer_id": producer.id,
+                        "consumer_id": consumer.id,
+                        "provider": response.provider_name,
+                        "timestamp": utc_now_iso(),
+                        **audit_output.model_dump(mode="json"),
+                    },
+                )
+
+                updated_seams = [*self.event_bus.state.audited_seams, seam_key]
+                self.event_bus.update_state(audited_seams=updated_seams)
+                self.event_bus.emit(
+                    EventType.SEAM_AUDIT_COMPLETED,
+                    task_id=consumer.id,
+                    role=AgentRole.SEAM_AUDITOR,
+                    provider=response.provider_name,
+                    payload={
+                        "seam_key": seam_key,
+                        "contract_id": contract_id,
+                        "producer_id": producer.id,
+                        "consumer_id": consumer.id,
+                        "verdict": audit_output.verdict,
+                        "summary": audit_output.summary,
+                        "findings_count": len(audit_output.findings),
+                        "report_path": str(report_path),
+                    },
+                )
+
+                if (
+                    audit_output.verdict == "CRITICAL"
+                    and self.config.workflow.seam_audit_pause_on_critical
+                ):
+                    raise _PausedByInfraError(
+                        reason=(
+                            f"Critical seam audit finding for {seam_key}: "
+                            f"{audit_output.summary} (report: {report_path})"
+                        ),
+                        pause_reason="seam_audit_critical",
+                        task_id=consumer.id,
+                        role=AgentRole.SEAM_AUDITOR,
+                        provider=response.provider_name,
+                    )
 
     # -------------------------------------------------------------------------
     # Architectural Escalation (STATUS: NEEDS_ARCH_CHANGE)

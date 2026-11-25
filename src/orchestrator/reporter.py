@@ -7,6 +7,7 @@ from pathlib import Path
 
 from orchestrator.fs_utils import atomic_write_text
 from orchestrator.models import PipelineState, Task, TaskStatus, utc_now_iso
+from orchestrator.stats import PipelineStats, compute_pipeline_stats, render_telemetry_markdown
 
 
 def render_report_markdown(
@@ -14,6 +15,7 @@ def render_report_markdown(
     project_name: str,
     state: PipelineState,
     tasks: list[Task],
+    stats: PipelineStats | None = None,
 ) -> str:
     """Render a concise run report and step-by-step manual QA checklist."""
     counts = Counter(t.status for t in tasks)
@@ -102,6 +104,9 @@ def render_report_markdown(
                     lines.append(f"- Worker report excerpt: {summary_line[:180]}")
             lines.append("")
 
+    if stats is not None:
+        lines.extend(["", render_telemetry_markdown(stats)])
+
     return "\n".join(lines).rstrip() + "\n"
 
 
@@ -111,11 +116,19 @@ def write_report(
     project_name: str,
     state: PipelineState,
     tasks: list[Task],
+    events_path: Path | None = None,
+    stats: PipelineStats | None = None,
 ) -> Path:
+    effective_stats = stats
+    if effective_stats is None:
+        candidate_events = events_path if events_path is not None else (report_path.parent / "events.jsonl")
+        if candidate_events.is_file():
+            effective_stats = compute_pipeline_stats(candidate_events)
     content = render_report_markdown(
         project_name=project_name,
         state=state,
         tasks=tasks,
+        stats=effective_stats,
     )
     atomic_write_text(report_path, content)
     return report_path

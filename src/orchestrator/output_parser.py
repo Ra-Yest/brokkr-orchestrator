@@ -13,6 +13,7 @@ from orchestrator.models import (
     ParsedWorkerOutput,
     ReviewOutput,
     ReviewVerdictType,
+    SeamAuditOutput,
     SubtaskSpec,
     Task,
     WorkerStatus,
@@ -21,9 +22,11 @@ from orchestrator.models import (
 __all__ = [
     "ContractCheckResult",
     "ReviewOutput",
+    "SeamAuditOutput",
     "parse_batch_review_verdicts",
     "parse_contract_checks",
     "parse_planner_subtasks",
+    "parse_seam_audit_output",
     "parse_single_review_verdict",
     "parse_worker_output",
 ]
@@ -361,3 +364,63 @@ def parse_planner_subtasks(text: str, parent_task: Task) -> ParsedPlannerOutput:
         raise ValueError(f"Planner must produce at least 2 subtasks, got {len(subtasks)}")
 
     return ParsedPlannerOutput(subtasks=subtasks, rationale=rationale)
+
+
+def parse_seam_audit_output(text: str) -> SeamAuditOutput:
+    """Parse BEGIN_SEAM_AUDIT_JSON..END_SEAM_AUDIT_JSON into SeamAuditOutput with WARNING fallback."""
+    raw_block = _extract_block(text, "BEGIN_SEAM_AUDIT_JSON", "END_SEAM_AUDIT_JSON")
+    if raw_block is None:
+        return SeamAuditOutput(
+            verdict="WARNING",
+            summary="Seam auditor output did not contain BEGIN_SEAM_AUDIT_JSON..END_SEAM_AUDIT_JSON.",
+            findings=[],
+        )
+
+    json_text = _unwrap_json_fence(raw_block)
+    if not json_text:
+        return SeamAuditOutput(
+            verdict="WARNING",
+            summary="Seam auditor output contained an empty BEGIN_SEAM_AUDIT_JSON block.",
+            findings=[],
+        )
+
+    try:
+        payload = json.loads(json_text)
+    except json.JSONDecodeError as exc:
+        return SeamAuditOutput(
+            verdict="WARNING",
+            summary=f"Invalid seam audit JSON ({exc.msg}).",
+            findings=[],
+        )
+
+    if not isinstance(payload, dict):
+        return SeamAuditOutput(
+            verdict="WARNING",
+            summary="Seam audit JSON payload must be a JSON object.",
+            findings=[],
+        )
+
+    normalized = dict(payload)
+    if isinstance(normalized.get("verdict"), str):
+        normalized["verdict"] = normalized["verdict"].strip().upper()
+    raw_findings = normalized.get("findings")
+    if isinstance(raw_findings, list):
+        norm_findings: list[object] = []
+        for item in raw_findings:
+            if isinstance(item, dict):
+                copy_item = dict(item)
+                if isinstance(copy_item.get("severity"), str):
+                    copy_item["severity"] = copy_item["severity"].strip().upper()
+                norm_findings.append(copy_item)
+            else:
+                norm_findings.append(item)
+        normalized["findings"] = norm_findings
+
+    try:
+        return SeamAuditOutput.model_validate(normalized)
+    except Exception as exc:
+        return SeamAuditOutput(
+            verdict="WARNING",
+            summary=f"Seam audit JSON failed schema validation: {exc}",
+            findings=[],
+        )

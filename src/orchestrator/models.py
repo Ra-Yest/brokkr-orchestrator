@@ -21,6 +21,7 @@ class AgentRole(StrEnum):
     WORKER_HARD = "worker_hard"
     PRE_REVIEWER = "pre_reviewer"
     REVIEWER = "reviewer"
+    SEAM_AUDITOR = "seam_auditor"
     ARCHITECT = "architect"
     REFACTORER = "refactorer"
 
@@ -33,7 +34,12 @@ ARCHITECT_ROLES: frozenset[AgentRole] = frozenset(
 )
 WRITING_ROLES: frozenset[AgentRole] = WORKER_ROLES | ARCHITECT_ROLES
 READ_ONLY_ROLES: frozenset[AgentRole] = frozenset(
-    {AgentRole.PLANNER, AgentRole.PRE_REVIEWER, AgentRole.REVIEWER}
+    {
+        AgentRole.PLANNER,
+        AgentRole.PRE_REVIEWER,
+        AgentRole.REVIEWER,
+        AgentRole.SEAM_AUDITOR,
+    }
 )
 
 
@@ -212,6 +218,19 @@ class ParsedPlannerOutput(BaseModel):
     rationale: str = ""
 
 
+class SeamAuditFinding(BaseModel):
+    severity: Literal["CRITICAL", "WARNING", "INFO"]
+    clause_id: str | None = None
+    description: str
+    file_refs: list[str] = Field(default_factory=list)
+
+
+class SeamAuditOutput(BaseModel):
+    verdict: Literal["PASS", "WARNING", "CRITICAL"]
+    summary: str
+    findings: list[SeamAuditFinding] = Field(default_factory=list)
+
+
 class EventType(StrEnum):
     RUN_STARTED = "run_started"
     RUN_FINISHED = "run_finished"
@@ -244,6 +263,7 @@ class EventType(StrEnum):
     DIFF_GUARD_FAILED = "diff_guard_failed"
     PRE_REVIEW_COMPLETED = "pre_review_completed"
     REVIEW_COMPLETED = "review_completed"
+    SEAM_AUDIT_COMPLETED = "seam_audit_completed"
     BATCH_REVIEW_STARTED = "batch_review_started"
     BATCH_REVIEW_DEFERRED = "batch_review_deferred"
     BATCH_VERDICT_RECEIVED = "batch_verdict_received"
@@ -334,6 +354,7 @@ class PipelineState(BaseModel):
     provider_quotas: dict[str, ProviderQuotaState] = Field(default_factory=dict)
     active_accounts: dict[str, str] = Field(default_factory=dict)
     proxy_health_status: ProxyHealthStatus | None = None
+    audited_seams: list[str] = Field(default_factory=list)
     updated_at: str = Field(default_factory=utc_now_iso)
 
 

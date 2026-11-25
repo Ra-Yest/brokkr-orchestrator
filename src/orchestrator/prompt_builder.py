@@ -18,6 +18,7 @@ DEFAULT_ROLE_PROMPT_FILES: dict[AgentRole, str] = {
     AgentRole.WORKER_HARD: "worker.md",
     AgentRole.PRE_REVIEWER: "pre_reviewer.md",
     AgentRole.REVIEWER: "reviewer.md",
+    AgentRole.SEAM_AUDITOR: "seam_auditor.md",
     AgentRole.ARCHITECT: "architect.md",
     AgentRole.REFACTORER: "refactorer.md",
 }
@@ -673,6 +674,132 @@ class PromptBuilder:
 
         dynamic_tail = normalize_newlines("\n\n---\n\n".join(dynamic_sections)).strip()
 
+        all_layers = [layer for layer in (static_prefix, semi_static, dynamic_tail) if layer]
+        full_text = normalize_newlines("\n\n===\n\n".join(all_layers)) + "\n"
+
+        return BuiltPrompt(
+            static_prefix=static_prefix,
+            semi_static_layer=semi_static,
+            dynamic_tail=dynamic_tail,
+            full_text=full_text,
+            static_prefix_sha256=static_hash,
+        )
+
+    def _render_seam_task_card(self, heading: str, task: Task) -> str:
+        lines = [
+            f"### {heading}: #{task.id} — {task.title}",
+            f"- **Allowed Paths:** {', '.join(task.allowed_paths) if task.allowed_paths else '(unrestricted green zone)'}",
+        ]
+        if task.final_commit_sha:
+            lines.append(f"- **Commit SHA:** `{task.final_commit_sha[:12]}`")
+        if task.changed_files:
+            lines.append(f"- **Changed Files:** {', '.join(f'`{p}`' for p in task.changed_files[:20])}")
+        if task.acceptance_criteria:
+            lines.append("- **Acceptance Criteria:**")
+            for item in task.acceptance_criteria:
+                lines.append(f"  - {item}")
+        return "\n".join(lines)
+
+    @staticmethod
+    def _truncate_evidence_block(text: str, budget: int) -> str:
+        norm = normalize_newlines(text).strip()
+        if len(norm) <= budget:
+            return norm
+        marker = f"\n... [truncated seam evidence at {budget} chars]"
+        if budget <= len(marker):
+            return norm[:budget]
+        return norm[: budget - len(marker)].rstrip("\n") + marker
+
+    def build_seam_audit_prompt(
+        self,
+        *,
+        profile: ProviderProfileConfig,
+        repo_map_text: str,
+        progress_text: str,
+        contract_id: str,
+        contract: ContractSpec,
+        producer: Task,
+        consumer: Task,
+        producer_diff: str = "",
+        consumer_diff: str = "",
+        producer_files: Mapping[str, str] | None = None,
+        consumer_files: Mapping[str, str] | None = None,
+        max_chars: int | None = None,
+    ) -> BuiltPrompt:
+        """Assemble a focused read-only 3-layer prompt for Pairwise Seam Audit."""
+        static_prefix = self.build_static_prefix(AgentRole.SEAM_AUDITOR, profile)
+        static_hash = sha256_text(static_prefix)
+        semi_static = self.build_semi_static_layer(
+            repo_map_text=repo_map_text,
+            progress_text=progress_text,
+        )
+
+        budget = max(1, max_chars if max_chars is not None else self.config.workflow.seam_audit_max_chars)
+
+        contract_lines: list[str] = [
+            f"## CONTRACT CLOSURE POINT: `{contract_id}` (`{contract.kind.value}`)",
+            f"- **Contract ID:** `{contract_id}`",
+            f"- **Kind:** `{contract.kind.value}`",
+        ]
+        if contract.surface:
+            contract_lines.append(f"- **Surface:** `{contract.surface}`")
+        if contract.spec_source:
+            contract_lines.append(f"- **Spec Source:** `{contract.spec_source}`")
+        if contract.fixtures:
+            fixtures_str = ", ".join(f"`{f}`" for f in contract.fixtures)
+            contract_lines.append(f"- **Fixtures:** {fixtures_str}")
+        if contract.description.strip():
+            contract_lines.append(
+                f"- **Description:** {normalize_newlines(contract.description).strip()}"
+            )
+        if contract.clauses:
+            contract_lines.append("- **Clauses:**")
+            for idx, clause in enumerate(contract.clauses, start=1):
+                contract_lines.append(f"  {idx}. [{clause.id}] {clause.rule}")
+
+        def _render_side_payload(diff_text: str, fallback_files: Mapping[str, str] | None) -> tuple[str, str]:
+            if diff_text.strip():
+                return "diff", normalize_newlines(diff_text).strip()
+            if fallback_files:
+                parts: list[str] = []
+                for rel_path in sorted(fallback_files):
+                    parts.append(f"#### `{rel_path}`\n```\n{normalize_newlines(fallback_files[rel_path]).strip()}\n```")
+                return "files", "\n\n".join(parts)
+            return "empty", "(no commit diff or surface files available)"
+
+        prod_kind, prod_raw = _render_side_payload(producer_diff, producer_files)
+        cons_kind, cons_raw = _render_side_payload(consumer_diff, consumer_files)
+
+        half_budget = max(1, budget // 2)
+        cons_used_est = min(len(cons_raw), half_budget)
+        prod_budget = half_budget + max(0, half_budget - cons_used_est)
+        cons_budget = max(1, budget - min(len(prod_raw), prod_budget))
+
+        prod_rendered = self._truncate_evidence_block(prod_raw, prod_budget)
+        cons_rendered = self._truncate_evidence_block(cons_raw, cons_budget)
+
+        if prod_kind == "diff":
+            prod_section = f"### Producer Diff (#{producer.id})\n```diff\n{prod_rendered}\n```"
+        else:
+            prod_section = f"### Producer Files (#{producer.id})\n{prod_rendered}"
+
+        if cons_kind == "diff":
+            cons_section = f"### Consumer Diff (#{consumer.id})\n```diff\n{cons_rendered}\n```"
+        else:
+            cons_section = f"### Consumer Files (#{consumer.id})\n{cons_rendered}"
+
+        dynamic_sections: list[str] = [
+            "\n".join(contract_lines),
+            "## PRODUCER & CONSUMER CARDS\n\n"
+            + self._render_seam_task_card("Producer", producer)
+            + "\n\n"
+            + self._render_seam_task_card("Consumer", consumer),
+            "## SEAM EVIDENCE (BOUNDED BY seam_audit_max_chars)\n\n"
+            + prod_section
+            + "\n\n"
+            + cons_section,
+        ]
+        dynamic_tail = normalize_newlines("\n\n---\n\n".join(dynamic_sections)).strip()
         all_layers = [layer for layer in (static_prefix, semi_static, dynamic_tail) if layer]
         full_text = normalize_newlines("\n\n===\n\n".join(all_layers)) + "\n"
 

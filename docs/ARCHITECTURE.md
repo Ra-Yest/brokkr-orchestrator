@@ -13,8 +13,9 @@ The AFK Orchestrator is a headless, event-driven Python 3.11+ pipeline runner de
 
 ```mermaid
 flowchart TD
-    CLI["cli.py (init, doctor, plan-check, run, status, control, report)"] --> CFG["config.py (PipelineConfig + optional env)"]
+    CLI["cli.py (init, doctor, plan-check, run, status, stats, control, report)"] --> CFG["config.py (PipelineConfig + optional env)"]
     CLI --> PLANCHK["plan_check.py (Deterministic + Optional --llm Plan Audit)"]
+    CLI --> STATS["stats.py (Pipeline Telemetry over events.jsonl)"]
     CLI --> RUNNER["runner.py (OrchestratorRunner)"]
     RUNNER --> STORE["stores/base.py -> LocalJsonTaskStore"]
     RUNNER --> REG["providers/base.py -> ProviderRegistry"]
@@ -107,6 +108,9 @@ stateDiagram-v2
   - **Frozen Contract Fixtures:** `diff_guard.contracts_protected_paths` (default `[".contracts/fixtures/**"]`) is enforced on par with `zones.red_protected` for all writing roles (`worker_*`, `architect`, `refactorer`) so agents cannot mutate shared contract fixtures.
   - **Pre-Flight Plan Audit (`orchestrator plan-check`):** Deterministic zero-token checks (`plan_check.py`) audit DAG cycles/duplicates/dangling deps, `done` tasks missing `final_commit_sha`, `allowed_paths` overlapping `red_protected`/`contracts_protected_paths`, nonexistent top-level directories, missing test-zone coverage, unresolvable `context_files`, empty or copy-pasted `verify_cmd`, oversized `easy`/`medium` scopes, and contract producer/consumer/spec topology (`--json` supported; exits `1` on `BLOCKER`, `0` otherwise). Optional `--llm` invokes read-only `planner` and merges `BEGIN_PLAN_AUDIT_JSON` findings.
   - **Seam Capsule & Evidence-Bound Review:** `PromptBuilder` injects `## SEAM CAPSULE (ACTIVE CONTRACTS)` into `worker`, `pre_reviewer`, and `reviewer` prompts whenever a task has active `provides`/`consumes` contracts. `output_parser.py` parses `BEGIN_CONTRACT_CHECKS_JSON` into `ReviewOutput.contract_checks` (`ContractCheckResult`). In `runner.py`, whenever active contracts declare `clauses`, an `APPROVE` verdict from `pre_reviewer` or `reviewer` is programmatically overridden to `REJECT` (`reason: "evidence_bound_review_failed"`) unless every required `clause_id` is marked `VERIFIED` with non-empty `evidence`. Tasks with active contract clauses bypass `batch_pending` so individual Evidence-Bound Review always runs.
+- **v0.3.2 Pairwise Seam Audit & Pipeline Telemetry (`orchestrator stats`):**
+  - **Pairwise Seam Audit at Contract Closure Points:** When consumer task `B` is committed (`done`) and `B.consumes` references a `contract_id` whose producer `A` (`contract_id in A.provides`) is already `done`, and `f"{contract_id}:{A.id}:{B.id}"` is not yet in `state.audited_seams`, the runner invokes the read-only `seam_auditor` role (`roles.seam_auditor`, defaulting to `roles.reviewer`; explicit profiles must have `can_edit_files: false`). `PromptBuilder.build_seam_audit_prompt()` feeds strictly the `ContractSpec`, producer/consumer task cards, and commit diffs (or fallback surface/changed files) bounded by `workflow.seam_audit_max_chars`. `output_parser.parse_seam_audit_output()` parses `BEGIN_SEAM_AUDIT_JSON` with safe `WARNING` fallback. Reports persist atomically to `.pipeline/seam_audits/<contract>__<A>__<B>.json`, the key is recorded in `state.audited_seams`, and `seam_audit_completed` is emitted. On `CRITICAL` verdict with `workflow.seam_audit_pause_on_critical: true`, the runner pauses (`pause_reason: "seam_audit_critical"`) and notifies Telegram before any downstream task starts.
+  - **Pipeline Telemetry (`stats.py`, `orchestrator stats`, `REPORT.md`):** `compute_pipeline_stats()` parses `.pipeline/events.jsonl` resiliently (skipping missing/empty/malformed lines) to compute provider active/wasted time (`succeeded_seconds`, `failed_seconds`, `rate_limited_seconds`, `wasted_pct`, `wasted_seconds_by_reason`), per-provider call/duration tables, `pre_reviewer` vs `reviewer` escape rate (`pre_review_escape_rate`), per-task call/failure metrics, and Seam Audit summary counts. Exposed via `orchestrator stats --repo <path> [--json]` and embedded as `## Pipeline Telemetry` in `.pipeline/REPORT.md`.
 
 ---
 
@@ -167,6 +171,7 @@ roles:
   worker_hard: <profile_name>      # Must have can_edit_files: true
   pre_reviewer: <profile_name>
   reviewer: <profile_name>
+  seam_auditor: <profile_name>?    # Optional; defaults to reviewer. When set, must have can_edit_files: false
   architect: <profile_name>        # Must have can_edit_files: true
   refactorer: <profile_name>       # Must have can_edit_files: true
   role_prompt_files: { <role>: string }  # Optional overrides
@@ -239,6 +244,9 @@ workflow:
   stall_grace_seconds: int              # Default: 30 (kill hung agent if no exit/file edit within grace window)
   context_file_max_chars: int           # Default: 12000 (per-file cap in PromptBuilder._render_context_files)
   context_files_total_max_chars: int    # Default: 40000 (total context_files char budget per prompt)
+  seam_audit_enabled: bool              # Default: true (enable Pairwise Seam Audit at contract closure points)
+  seam_audit_pause_on_critical: bool    # Default: true (pause pipeline with reason='seam_audit_critical' on CRITICAL)
+  seam_audit_max_chars: int             # Default: 40000 (total evidence char budget for producer + consumer diffs/files)
 
 notifications:
   telegram:
@@ -350,7 +358,7 @@ Each line is a self-contained UTF-8 JSON object:
 ```
 
 Canonical `event_type` values:
-`run_started`, `run_finished`, `run_aborted`, `orchestrator_fatal_error`, `task_claimed`, `task_deferred_cooldown`, `task_status_changed`, `provider_invoked`, `provider_response_started`, `provider_recovered_after_retry`, `provider_succeeded`, `provider_failed`, `provider_rate_limited`, `provider_transport_retry`, `provider_transient_retry`, `provider_fallback_used`, `provider_account_switched`, `provider_account_switch_failed`, `agent_commit_soft_reset`, `stale_lock_recovered`, `crash_recovery_completed`, `gate_started`, `gate_passed`, `gate_failed`, `placeholder_guard_failed`, `red_zone_violation`, `yellow_zone_triggered`, `diff_guard_soft_warning`, `diff_guard_failed`, `pre_review_completed`, `review_completed`, `batch_review_started`, `batch_review_deferred`, `batch_verdict_received`, `escalation_triggered`, `architect_resolved`, `task_split`, `refactor_started`, `refactor_finished`, `refactor_reverted`, `git_committed`, `git_reverted`, `task_rolled_back`, `control_command_applied`, `inbox_consumed`, `pause_entered`, `pause_resumed`, `runner_hibernating`, `runner_woke_up`, `proxy_status_changed`, `proxy_error`, `report_generated`.
+`run_started`, `run_finished`, `run_aborted`, `orchestrator_fatal_error`, `task_claimed`, `task_deferred_cooldown`, `task_status_changed`, `provider_invoked`, `provider_response_started`, `provider_recovered_after_retry`, `provider_succeeded`, `provider_failed`, `provider_rate_limited`, `provider_transport_retry`, `provider_transient_retry`, `provider_fallback_used`, `provider_account_switched`, `provider_account_switch_failed`, `agent_commit_soft_reset`, `stale_lock_recovered`, `crash_recovery_completed`, `gate_started`, `gate_passed`, `gate_failed`, `placeholder_guard_failed`, `red_zone_violation`, `yellow_zone_triggered`, `diff_guard_soft_warning`, `diff_guard_failed`, `pre_review_completed`, `review_completed`, `seam_audit_completed`, `batch_review_started`, `batch_review_deferred`, `batch_verdict_received`, `escalation_triggered`, `architect_resolved`, `task_split`, `refactor_started`, `refactor_finished`, `refactor_reverted`, `git_committed`, `git_reverted`, `task_rolled_back`, `control_command_applied`, `inbox_consumed`, `pause_entered`, `pause_resumed`, `runner_hibernating`, `runner_woke_up`, `proxy_status_changed`, `proxy_error`, `report_generated`.
 
 ### 3.4 `state.json` Schema (Atomically Replaced Snapshot)
 
@@ -400,6 +408,7 @@ Written via temp-file + `fsync` + `os.replace()` with a 5-attempt Windows `Permi
     "raw_excerpt": "...",
     "checked_at": "2026-11-22T08:47:40Z"
   },
+  "audited_seams": ["C-HEALTH-WIRE:T-001:T-002"],
   "updated_at": "2026-11-20T20:01:15Z"
 }
 ```

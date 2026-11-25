@@ -167,6 +167,8 @@ roles:
   worker_hard: "provider_strong"
   pre_reviewer: "provider_pre_reviewer_agy"  # Can also use `provider_reviewer_api`
   reviewer: "provider_master"           # Can also use `provider_reviewer_api`
+  # Optional dedicated read-only seam auditor (defaults to `reviewer` if omitted; when set, must have can_edit_files: false)
+  # seam_auditor: "provider_reviewer_api"
   architect: "provider_master"          # Must have can_edit_files: true
   refactorer: "provider_master"         # Must have can_edit_files: true
 
@@ -324,6 +326,10 @@ workflow:
   # Context files prompt budget (prevents oversized context_files from blowing up prompt size)
   context_file_max_chars: 12000
   context_files_total_max_chars: 40000
+  # Pairwise Seam Audit at Contract Closure Points (runs read-only seam_auditor when consumer B closes contract provided by done A)
+  seam_audit_enabled: true
+  seam_audit_pause_on_critical: true
+  seam_audit_max_chars: 40000
 
 notifications:
   telegram:
