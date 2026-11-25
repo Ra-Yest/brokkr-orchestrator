@@ -7,7 +7,7 @@
 
 ## 1. Project Identity & Core Principle
 
-- **What this repo is:** `afk-orchestrator` (`v0.3.2`, entry point `orchestrator.cli:main`), a headless, fault-tolerant local AFK AI development pipeline runner.
+- **What this repo is:** `afk-orchestrator` (`v0.4.0`, entry point `orchestrator.cli:main`), a headless, fault-tolerant local AFK AI development pipeline runner.
 - **Stack:** Python `>=3.11`, Pydantic v2 (`>=2.6,<3.0`), PyYAML (`>=6.0`). Dev toolchain: `pytest`, `ruff` (`line-length = 100`, rules `E,F,I,UP,B,SIM,RUF`, ignoring `E501`), `mypy --strict` (`packages = ["orchestrator"]`).
 - **Core Principle — Stack-Agnostic Core:** Runner and guard logic MUST remain completely agnostic of target project languages, frameworks, and AI CLI tools. Never hardcode language-specific build logic or model/CLI names in `runner.py` or guards. Any default globs, patterns, or limits in `src/orchestrator/config.py` MUST be fully overridable via `pipeline.yaml`. Keep provider (`BaseAgentProvider`) and task-store (`BaseTaskStore`) abstractions decoupled from `runner.py`.
 
@@ -17,7 +17,8 @@
 
 | Path | Responsibility |
 |---|---|
-| `src/orchestrator/runner.py` | Core FSM loop, task claiming, batching, escalations, auto-split, retries, hibernation, rollback. |
+| `src/orchestrator/runner.py` | Thin `OrchestratorRunner` facade: main FSM loop, task selection, worker execution loop, progress/report helpers, and backward-compatible re-exports. |
+| `src/orchestrator/runtime/` | Composable runner subsystems: `errors.py` (exceptions), `lifecycle.py` (locks, crash recovery, control/pause/hibernation), `provider_executor.py` (guarded provider calls, retries, quota/fallback, proxy/account checks, Integrity & Diff Guard), `review_pipeline.py` (single/batch review, Evidence-Bound Review, Pairwise Seam Audits), `escalation_manager.py` (architect escalations, hard-task auto-split, refactorer, rollback). |
 | `src/orchestrator/config.py` | Pydantic v2 `PipelineConfig` schema, defaults, `${ENV}` resolution, and role/provider validation. |
 | `src/orchestrator/models.py` | Domain models (`Task`, `TasksFile`, `PipelineState`, `PipelineEvent`, `ControlCommand`, enums). |
 | `src/orchestrator/diff_guard.py` | Role-aware Red/Yellow/Green zone checks, soft/hard diff limits, test ban, paired paths, placeholder guard. |

@@ -78,7 +78,8 @@ def _c1_contract() -> dict[str, ContractSpec]:
 
 
 def test_version_and_seam_auditor_role_validation() -> None:
-    assert __version__ == "0.3.2"
+    parsed_version = tuple(int(part) for part in __version__.split(".")[:3])
+    assert parsed_version >= (0, 3, 2)
 
     edit_profile = ProviderProfileConfig(kind="cli", can_edit_files=True, command=["echo"])
     ro_profile = ProviderProfileConfig(

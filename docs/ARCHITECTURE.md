@@ -16,21 +16,25 @@ flowchart TD
     CLI["cli.py (init, doctor, plan-check, run, status, stats, control, report)"] --> CFG["config.py (PipelineConfig + optional env)"]
     CLI --> PLANCHK["plan_check.py (Deterministic + Optional --llm Plan Audit)"]
     CLI --> STATS["stats.py (Pipeline Telemetry over events.jsonl)"]
-    CLI --> RUNNER["runner.py (OrchestratorRunner)"]
+    CLI --> RUNNER["runner.py (OrchestratorRunner facade)"]
+    RUNNER --> RT_LIFE["runtime/lifecycle.py (RunnerLifecycleManager)"]
+    RUNNER --> RT_EXEC["runtime/provider_executor.py (ProviderExecutor)"]
+    RUNNER --> RT_REV["runtime/review_pipeline.py (ReviewPipeline)"]
+    RUNNER --> RT_ESC["runtime/escalation_manager.py (EscalationManager)"]
     RUNNER --> STORE["stores/base.py -> LocalJsonTaskStore"]
-    RUNNER --> REG["providers/base.py -> ProviderRegistry"]
+    RT_EXEC --> REG["providers/base.py -> ProviderRegistry"]
     REG --> CLIPROV["providers/cli_provider.py (CliAgentProvider)"]
     REG --> APIPROV["providers/api_provider.py (ApiAgentProvider)"]
     CLIPROV --> PROC["process_utils.py (Streaming stdout/stderr, Idle Timeout, Job Objects)"]
     RUNNER --> PB["prompt_builder.py (3-Layer Cache + REPO_MAP)"]
-    RUNNER --> GIT["git_ops.py (base_sha, add -N, revert, rollback)"]
-    RUNNER --> GUARD["diff_guard.py (Role-aware Zones, Soft/Hard Diff & Placeholder Guard)"]
+    RT_EXEC --> GIT["git_ops.py (base_sha, add -N, revert, rollback)"]
+    RT_EXEC --> GUARD["diff_guard.py (Role-aware Zones, Soft/Hard Diff & Placeholder Guard)"]
     RUNNER --> GATES["gates.py (Free Gates, Playwright, Log Trimmer)"]
-    RUNNER --> PARSER["output_parser.py (STATUS / VERDICT / JSON Subtasks)"]
+    RT_REV --> PARSER["output_parser.py (STATUS / VERDICT / JSON Subtasks / Seam Audit)"]
     RUNNER --> EVENTS["events.py (events.jsonl, state.json, QuotaTracker)"]
-    RUNNER --> CTRL["control.py (control_inbox -> control_processed, INBOX.md)"]
+    RT_LIFE --> CTRL["control.py (control_inbox -> control_processed, INBOX.md)"]
     RUNNER --> NOTIFY["notifications.py (TelegramNotifier)"]
-    RUNNER --> PROXY["proxy_monitor.py (BaseProxyMonitor -> GenericProxyMonitor)"]
+    RT_EXEC --> PROXY["proxy_monitor.py (BaseProxyMonitor -> GenericProxyMonitor)"]
     RUNNER --> REPORT["reporter.py (REPORT.md + Manual Checklist)"]
 ```
 
@@ -111,6 +115,13 @@ stateDiagram-v2
 - **v0.3.2 Pairwise Seam Audit & Pipeline Telemetry (`orchestrator stats`):**
   - **Pairwise Seam Audit at Contract Closure Points:** When consumer task `B` is committed (`done`) and `B.consumes` references a `contract_id` whose producer `A` (`contract_id in A.provides`) is already `done`, and `f"{contract_id}:{A.id}:{B.id}"` is not yet in `state.audited_seams`, the runner invokes the read-only `seam_auditor` role (`roles.seam_auditor`, defaulting to `roles.reviewer`; explicit profiles must have `can_edit_files: false`). `PromptBuilder.build_seam_audit_prompt()` feeds strictly the `ContractSpec`, producer/consumer task cards, and commit diffs (or fallback surface/changed files) bounded by `workflow.seam_audit_max_chars`. `output_parser.parse_seam_audit_output()` parses `BEGIN_SEAM_AUDIT_JSON` with safe `WARNING` fallback. Reports persist atomically to `.pipeline/seam_audits/<contract>__<A>__<B>.json`, the key is recorded in `state.audited_seams`, and `seam_audit_completed` is emitted. On `CRITICAL` verdict with `workflow.seam_audit_pause_on_critical: true`, the runner pauses (`pause_reason: "seam_audit_critical"`) and notifies Telegram before any downstream task starts.
   - **Pipeline Telemetry (`stats.py`, `orchestrator stats`, `REPORT.md`):** `compute_pipeline_stats()` parses `.pipeline/events.jsonl` resiliently (skipping missing/empty/malformed lines) to compute provider active/wasted time (`succeeded_seconds`, `failed_seconds`, `rate_limited_seconds`, `wasted_pct`, `wasted_seconds_by_reason`), per-provider call/duration tables, `pre_reviewer` vs `reviewer` escape rate (`pre_review_escape_rate`), per-task call/failure metrics, and Seam Audit summary counts. Exposed via `orchestrator stats --repo <path> [--json]` and embedded as `## Pipeline Telemetry` in `.pipeline/REPORT.md`.
+- **v0.4.0 Modular Runtime Decomposition (`src/orchestrator/runtime/`):**
+  - Strictly behavior-preserving decomposition of `runner.py` into composition-based runtime collaborators with zero circular imports and full backward-compatible re-exports in `orchestrator.runner`:
+    - `runtime/errors.py`: `OrchestratorFatalError`, `RunnerLockError`, and internal flow-control signals (`_AbortedByControlError`, `_TaskDeferredOnCooldownError`, `_PausedByInfraError`).
+    - `runtime/lifecycle.py` (`RunnerLifecycleManager`): PID lockfiles, preflight/crash recovery, clean abort rollback, control inbox polling, pauses, hibernation, and backoff ticks.
+    - `runtime/provider_executor.py` (`ProviderExecutor`): provider failure classification, fallback/cooldown routing, proxy monitor probes, sequential account switching, decomposed guarded provider invocation, Integrity Guard, role-aware Diff Guard, and attempt artifact persistence.
+    - `runtime/review_pipeline.py` (`ReviewPipeline`): batch queue management, Evidence-Bound Review checks, `pre_reviewer`/`reviewer` single & batch flows, `needs_review` resumption, and Pairwise Seam Audits.
+    - `runtime/escalation_manager.py` (`EscalationManager`): `arch_pending` resumption, Architect escalations, Planner hard-task auto-splitting, scheduled Refactorer runs, and task failure rollback with dependent cascade blocking.
 
 ---
 
