@@ -7,7 +7,7 @@
 
 ## 1. Project Identity & Core Principle
 
-- **What this repo is:** `afk-orchestrator` (`v0.3.0`, entry point `orchestrator.cli:main`), a headless, fault-tolerant local AFK AI development pipeline runner.
+- **What this repo is:** `afk-orchestrator` (`v0.3.1`, entry point `orchestrator.cli:main`), a headless, fault-tolerant local AFK AI development pipeline runner.
 - **Stack:** Python `>=3.11`, Pydantic v2 (`>=2.6,<3.0`), PyYAML (`>=6.0`). Dev toolchain: `pytest`, `ruff` (`line-length = 100`, rules `E,F,I,UP,B,SIM,RUF`, ignoring `E501`), `mypy --strict` (`packages = ["orchestrator"]`).
 - **Core Principle — Stack-Agnostic Core:** Runner and guard logic MUST remain completely agnostic of target project languages, frameworks, and AI CLI tools. Never hardcode language-specific build logic or model/CLI names in `runner.py` or guards. Any default globs, patterns, or limits in `src/orchestrator/config.py` MUST be fully overridable via `pipeline.yaml`. Keep provider (`BaseAgentProvider`) and task-store (`BaseTaskStore`) abstractions decoupled from `runner.py`.
 
@@ -27,7 +27,8 @@
 | `src/orchestrator/git_ops.py` | Git wrapper (`base_sha`, `add -N`, `reset --soft`, `commit`, selective `revert`, rollback). |
 | `src/orchestrator/providers/` | `BaseAgentProvider` + `ProviderRegistry` (`base.py`), `CliAgentProvider` (`cli_provider.py`), `ApiAgentProvider` (`api_provider.py`). |
 | `src/orchestrator/stores/` | `BaseTaskStore` (`base.py`) and `LocalJsonTaskStore` (`local_json.py`) for DAG validation and task persistence. |
-| `src/orchestrator/cli.py` | CLI commands (`init`, `doctor`, `run`, `status`, `control`, `report`); wires runner, gates, events, control, reporter. |
+| `src/orchestrator/cli.py` | CLI commands (`init`, `doctor`, `plan-check`, `run`, `status`, `control`, `report`); wires runner, gates, events, control, reporter. |
+| `src/orchestrator/plan_check.py` | Pre-flight plan audit (`orchestrator plan-check`): deterministic DAG/paths/contracts checks + optional `--llm` planner audit. |
 | `src/orchestrator/` (support) | `gates.py` (commands/Playwright), `events.py` (`events.jsonl`/quotas), `control.py` (`control_inbox/`), `output_parser.py`, `fs_utils.py`, `notifications.py`, `reporter.py`. |
 | `templates/.agents/` | Default target-repo role prompts (`worker.md`, `reviewer.md`, `pre_reviewer.md`, `planner.md`, `architect.md`, `refactorer.md`, `anti_laziness_openai.md`). |
 | `docs/ARCHITECTURE.md` | Authoritative FSM, exact schemas, and integration contracts (`pipeline.example.yaml` is the reference config). |

@@ -7,14 +7,26 @@ import re
 from collections.abc import Sequence
 
 from orchestrator.models import (
+    ContractCheckResult,
     ParsedPlannerOutput,
     ParsedReviewVerdict,
     ParsedWorkerOutput,
+    ReviewOutput,
     ReviewVerdictType,
     SubtaskSpec,
     Task,
     WorkerStatus,
 )
+
+__all__ = [
+    "ContractCheckResult",
+    "ReviewOutput",
+    "parse_batch_review_verdicts",
+    "parse_contract_checks",
+    "parse_planner_subtasks",
+    "parse_single_review_verdict",
+    "parse_worker_output",
+]
 
 _ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
 _CODE_FENCE_RE = re.compile(r"```.*?```", re.DOTALL)
@@ -150,8 +162,56 @@ def parse_worker_output(text: str) -> ParsedWorkerOutput:
     )
 
 
-def parse_single_review_verdict(text: str, task_id: str) -> ParsedReviewVerdict:
-    """Parse VERDICT: APPROVE / REJECT from pre_reviewer or reviewer output."""
+def _unwrap_json_fence(raw_block: str) -> str:
+    """Strip optional Markdown code fences (```json ... ```) around an extracted JSON payload."""
+    cleaned = _ANSI_RE.sub("", raw_block).strip()
+    fence_match = re.search(r"```(?:json)?\s*(.*?)```", cleaned, re.DOTALL | re.IGNORECASE)
+    if fence_match:
+        return fence_match.group(1).strip()
+    return cleaned
+
+
+def parse_contract_checks(text: str) -> list[ContractCheckResult]:
+    """Parse optional BEGIN_CONTRACT_CHECKS_JSON..END_CONTRACT_CHECKS_JSON block from review output."""
+    raw_block = _extract_block(text, "BEGIN_CONTRACT_CHECKS_JSON", "END_CONTRACT_CHECKS_JSON")
+    if raw_block is None:
+        return []
+
+    json_text = _unwrap_json_fence(raw_block)
+    if not json_text:
+        return []
+
+    try:
+        payload = json.loads(json_text)
+    except json.JSONDecodeError:
+        return []
+
+    if isinstance(payload, list):
+        raw_items = payload
+    elif isinstance(payload, dict):
+        candidate = payload.get("contract_checks") or payload.get("checks")
+        if not isinstance(candidate, list):
+            return []
+        raw_items = candidate
+    else:
+        return []
+
+    results: list[ContractCheckResult] = []
+    for item in raw_items:
+        if not isinstance(item, dict):
+            continue
+        normalized = dict(item)
+        if isinstance(normalized.get("status"), str):
+            normalized["status"] = normalized["status"].strip().upper()
+        try:
+            results.append(ContractCheckResult.model_validate(normalized))
+        except Exception:
+            continue
+    return results
+
+
+def parse_single_review_verdict(text: str, task_id: str) -> ReviewOutput:
+    """Parse VERDICT: APPROVE / REJECT and optional contract checks from review output."""
     matches, _ = _find_matches_with_fallback(_SINGLE_VERDICT_RE, text)
     verdict = ReviewVerdictType.UNKNOWN
     if matches:
@@ -161,7 +221,13 @@ def parse_single_review_verdict(text: str, task_id: str) -> ParsedReviewVerdict:
     if feedback is None:
         feedback = text.strip()
 
-    return ParsedReviewVerdict(task_id=task_id, verdict=verdict, feedback=feedback)
+    contract_checks = parse_contract_checks(text)
+    return ParsedReviewVerdict(
+        task_id=task_id,
+        verdict=verdict,
+        feedback=feedback,
+        contract_checks=contract_checks,
+    )
 
 
 def _collect_batch_hits(

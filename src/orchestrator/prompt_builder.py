@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
 from orchestrator.config import PipelineConfig, ProviderProfileConfig
 from orchestrator.diff_guard import _split_diff_sections, matches_any_glob
 from orchestrator.fs_utils import normalize_newlines, sha256_text
-from orchestrator.models import AgentRole, Task
+from orchestrator.models import WORKER_ROLES, AgentRole, ContractSpec, Task
 
 DEFAULT_ROLE_PROMPT_FILES: dict[AgentRole, str] = {
     AgentRole.PLANNER: "planner.md",
@@ -418,6 +419,44 @@ class PromptBuilder:
                 body = body[: max_chars - len(suffix)].rstrip() + suffix
         return f"## DOWNSTREAM CONSUMERS (DO NOT BREAK CONTRACT)\n\n{body}"
 
+    def _render_seam_capsule(
+        self,
+        task: Task,
+        contracts: Mapping[str, ContractSpec] | None,
+    ) -> str:
+        if not contracts or (not task.provides and not task.consumes):
+            return ""
+        entries: list[tuple[str, str, ContractSpec]] = []
+        for cid in task.provides:
+            spec = contracts.get(cid)
+            if spec is not None:
+                entries.append(("PROVIDES", cid, spec))
+        for cid in task.consumes:
+            spec = contracts.get(cid)
+            if spec is not None:
+                entries.append(("CONSUMES", cid, spec))
+        if not entries:
+            return ""
+
+        blocks: list[str] = ["## SEAM CAPSULE (ACTIVE CONTRACTS)"]
+        for direction, cid, spec in entries:
+            lines: list[str] = [f"### [{direction}] {cid} (`{spec.kind.value}`)"]
+            if spec.surface:
+                lines.append(f"- **Surface:** `{spec.surface}`")
+            if spec.spec_source:
+                lines.append(f"- **Spec Source:** `{spec.spec_source}`")
+            if spec.fixtures:
+                fixtures_str = ", ".join(f"`{f}`" for f in spec.fixtures)
+                lines.append(f"- **Fixtures:** {fixtures_str}")
+            if spec.description.strip():
+                lines.append(f"- **Description:** {normalize_newlines(spec.description).strip()}")
+            if spec.clauses:
+                lines.append("- **Clauses:**")
+                for idx, clause in enumerate(spec.clauses, start=1):
+                    lines.append(f"  {idx}. [{clause.id}] {clause.rule}")
+            blocks.append("\n".join(lines))
+        return "\n\n".join(blocks)
+
     def _render_task_card(self, task: Task) -> str:
         lines = [
             f"### Task #{task.id}: {task.title}",
@@ -466,6 +505,7 @@ class PromptBuilder:
         review_feedback: str | None = None,
         last_report: str | None = None,
         downstream_tasks: list[Task] | None = None,
+        contracts: Mapping[str, ContractSpec] | None = None,
         escalation_context: str | None = None,
         extra_instructions: str | None = None,
     ) -> BuiltPrompt:
@@ -514,6 +554,10 @@ class PromptBuilder:
 
         if task is not None:
             dynamic_sections.append(f"## ACTIVE TASK\n\n{self._render_task_card(task)}")
+            if role in (WORKER_ROLES | {AgentRole.PRE_REVIEWER, AgentRole.REVIEWER}):
+                seam_capsule = self._render_seam_capsule(task, contracts)
+                if seam_capsule:
+                    dynamic_sections.append(seam_capsule)
             if downstream_tasks:
                 downstream_block = self._render_downstream_consumers(downstream_tasks)
                 if downstream_block:

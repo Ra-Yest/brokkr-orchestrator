@@ -13,7 +13,8 @@ The AFK Orchestrator is a headless, event-driven Python 3.11+ pipeline runner de
 
 ```mermaid
 flowchart TD
-    CLI["cli.py (init, doctor, run, status, control, report)"] --> CFG["config.py (PipelineConfig + optional env)"]
+    CLI["cli.py (init, doctor, plan-check, run, status, control, report)"] --> CFG["config.py (PipelineConfig + optional env)"]
+    CLI --> PLANCHK["plan_check.py (Deterministic + Optional --llm Plan Audit)"]
     CLI --> RUNNER["runner.py (OrchestratorRunner)"]
     RUNNER --> STORE["stores/base.py -> LocalJsonTaskStore"]
     RUNNER --> REG["providers/base.py -> ProviderRegistry"]
@@ -101,6 +102,11 @@ stateDiagram-v2
   - **Stalled-Agent Output Detector:** `run_noninteractive_process()` matches `stall_stdout_patterns` (e.g., `waiting for \d+ background task`, `root agent idle; waiting for`) on streaming `stdout`/`stderr`; if the process neither exits nor modifies workspace files within `stall_grace_seconds` (default 30s), it terminates the process tree with `timed_out=True, idle_timed_out=True` and a clear `stall_reason` in metadata/logs.
   - **Paired Lock-File Paths in Diff Guard:** `diff_guard.paired_paths` automatically permits companion lock files (e.g., `app/pubspec.lock`, `go.sum`, `package-lock.json`, `Cargo.lock`) in the same directory whenever `task.allowed_paths` permits the corresponding manifest, while keeping `zones.red_protected` unconditionally blocked.
   - **Review Prompt Context & Budget:** `prepare_review_diff()` sorts sections into 4 priority tiers (P1 yellow/schemas -> P2 production code -> P3 tests -> P4 data/fixtures/docs) before applying `review_diff_max_chars`; `PromptBuilder` injects `## DOWNSTREAM CONSUMERS (DO NOT BREAK CONTRACT)` for direct dependent tasks, `## GATE EXECUTION SUMMARY` for review roles, and enforces `context_file_max_chars` / `context_files_total_max_chars` budgets.
+- **v0.3.1 Contract Layer, `plan-check`, and Evidence-Bound Review:**
+  - **Typed Contracts in `tasks.json`:** Optional `contracts` mapping (`ContractSpec` with `kind` in `artifact | entity | value | wire | fsm`, `surface`, `description`, `spec_source`, `fixtures`, `clauses`) and per-task `provides`/`consumes` lists (100% backward compatible). Validation enforces unique clause IDs per contract, non-empty `clauses` for `entity`/`value`/`wire`, non-`.md` machine-readable `spec_source` for `fsm`, and non-empty `surface` for `artifact`.
+  - **Frozen Contract Fixtures:** `diff_guard.contracts_protected_paths` (default `[".contracts/fixtures/**"]`) is enforced on par with `zones.red_protected` for all writing roles (`worker_*`, `architect`, `refactorer`) so agents cannot mutate shared contract fixtures.
+  - **Pre-Flight Plan Audit (`orchestrator plan-check`):** Deterministic zero-token checks (`plan_check.py`) audit DAG cycles/duplicates/dangling deps, `done` tasks missing `final_commit_sha`, `allowed_paths` overlapping `red_protected`/`contracts_protected_paths`, nonexistent top-level directories, missing test-zone coverage, unresolvable `context_files`, empty or copy-pasted `verify_cmd`, oversized `easy`/`medium` scopes, and contract producer/consumer/spec topology (`--json` supported; exits `1` on `BLOCKER`, `0` otherwise). Optional `--llm` invokes read-only `planner` and merges `BEGIN_PLAN_AUDIT_JSON` findings.
+  - **Seam Capsule & Evidence-Bound Review:** `PromptBuilder` injects `## SEAM CAPSULE (ACTIVE CONTRACTS)` into `worker`, `pre_reviewer`, and `reviewer` prompts whenever a task has active `provides`/`consumes` contracts. `output_parser.py` parses `BEGIN_CONTRACT_CHECKS_JSON` into `ReviewOutput.contract_checks` (`ContractCheckResult`). In `runner.py`, whenever active contracts declare `clauses`, an `APPROVE` verdict from `pre_reviewer` or `reviewer` is programmatically overridden to `REJECT` (`reason: "evidence_bound_review_failed"`) unless every required `clause_id` is marked `VERIFIED` with non-empty `evidence`. Tasks with active contract clauses bypass `batch_pending` so individual Evidence-Bound Review always runs.
 
 ---
 
@@ -187,6 +193,7 @@ diff_guard:
   exclude_from_review: [glob]
   readonly_ignore_paths: [glob]    # Default: ["go.work.sum", "**/go.work.sum"] (ignored & cleaned for read-only roles)
   paired_paths: { glob: [glob] }   # Companion lock files auto-allowed alongside permitted manifests in the same directory
+  contracts_protected_paths: [glob] # Default: [".contracts/fixtures/**"] (treated as Red Zone for all writing roles)
 
 placeholder_guard:
   enabled: bool
@@ -270,6 +277,19 @@ proxy_monitor:
 ```json
 {
   "schema_version": 1,
+  "contracts": {
+    "C-HEALTH-WIRE": {
+      "kind": "wire",
+      "surface": "GET /health",
+      "description": "Healthcheck HTTP response contract",
+      "spec_source": null,
+      "fixtures": [".contracts/fixtures/health_ok.json"],
+      "clauses": [
+        {"id": "INV-1", "rule": "Returns HTTP 200 with JSON {\"status\": \"ok\"}"},
+        {"id": "ERR-1", "rule": "Non-GET methods return HTTP 405"}
+      ]
+    }
+  },
   "tasks": [
     {
       "id": "T-001",
@@ -284,6 +304,8 @@ proxy_monitor:
       "acceptance_criteria": [
         "GET /health returns HTTP 200 and JSON {\"status\": \"ok\"}"
       ],
+      "provides": ["C-HEALTH-WIRE"],
+      "consumes": [],
       "stage": "stage-1",
       "attempts": 0,
       "review_rounds": 0,

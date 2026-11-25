@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 from orchestrator.fs_utils import atomic_write_json
-from orchestrator.models import Task, TaskComment, TasksFile, TaskStatus, utc_now_iso
+from orchestrator.models import ContractSpec, Task, TaskComment, TasksFile, TaskStatus, utc_now_iso
 from orchestrator.stores.base import BaseTaskStore
 
 
@@ -75,6 +75,11 @@ class LocalJsonTaskStore(BaseTaskStore):
 
     def list_tasks(self) -> list[Task]:
         return [task.model_copy(deep=True) for task in self._data.tasks]
+
+    def list_contracts(self) -> dict[str, ContractSpec]:
+        return {
+            cid: spec.model_copy(deep=True) for cid, spec in self._data.contracts.items()
+        }
 
     def get_task(self, task_id: str) -> Task:
         idx = self._index()
@@ -196,7 +201,11 @@ class LocalJsonTaskStore(BaseTaskStore):
             else:
                 rewired_tasks.append(existing)
 
-        self._data = TasksFile(schema_version=self._data.schema_version, tasks=rewired_tasks)
+        self._data = TasksFile(
+            schema_version=self._data.schema_version,
+            contracts=dict(self._data.contracts),
+            tasks=rewired_tasks,
+        )
         self._save()
         return [st.model_copy(deep=True) for st in normalized_subtasks]
 

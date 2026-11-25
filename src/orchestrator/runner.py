@@ -38,9 +38,11 @@ from orchestrator.models import (
     WORKER_ROLES,
     WRITING_ROLES,
     AgentRole,
+    ContractCheckResult,
     ControlAction,
     ControlCommand,
     EventType,
+    ParsedReviewVerdict,
     ParsedWorkerOutput,
     ProxyHealthStatus,
     ReviewVerdictType,
@@ -2154,6 +2156,72 @@ class OrchestratorRunner:
         """Return direct downstream tasks that depend on task_id."""
         return [t for t in self.store.list_tasks() if task_id in t.depends_on]
 
+    def _required_clause_ids_for_task(self, task: Task) -> list[str]:
+        """Collect deterministic deduplicated clause IDs from contracts in task.provides/consumes."""
+        if not task.provides and not task.consumes:
+            return []
+        contracts = self.store.list_contracts()
+        if not contracts:
+            return []
+        required: list[str] = []
+        seen: set[str] = set()
+        for cid in (*task.provides, *task.consumes):
+            spec = contracts.get(cid)
+            if spec is None:
+                continue
+            for clause in spec.clauses:
+                if clause.id not in seen:
+                    seen.add(clause.id)
+                    required.append(clause.id)
+        return required
+
+    def _check_evidence_bound_review(
+        self,
+        task: Task,
+        verdict: ParsedReviewVerdict,
+    ) -> tuple[bool, list[str], str]:
+        """Verify that an APPROVE verdict supplies VERIFIED + non-empty evidence for every required clause."""
+        required_ids = self._required_clause_ids_for_task(task)
+        if not required_ids:
+            return True, [], ""
+
+        checks_by_id: dict[str, ContractCheckResult] = {
+            chk.clause_id: chk for chk in verdict.contract_checks
+        }
+        failed_ids: list[str] = []
+        issue_lines: list[str] = []
+        for clause_id in required_ids:
+            entry = checks_by_id.get(clause_id)
+            if entry is None:
+                failed_ids.append(clause_id)
+                issue_lines.append(
+                    f"- `{clause_id}`: missing from BEGIN_CONTRACT_CHECKS_JSON"
+                )
+            elif entry.status != "VERIFIED":
+                failed_ids.append(clause_id)
+                detail = f" ({entry.evidence.strip()})" if entry.evidence.strip() else ""
+                issue_lines.append(
+                    f"- `{clause_id}`: status={entry.status}{detail}"
+                )
+            elif not entry.evidence.strip():
+                failed_ids.append(clause_id)
+                issue_lines.append(
+                    f"- `{clause_id}`: status=VERIFIED but missing non-empty evidence citation"
+                )
+
+        if not failed_ids:
+            return True, [], ""
+
+        header = (
+            "Evidence-Bound Review failed (`evidence_bound_review_failed`): "
+            "reviewer APPROVE was overridden to REJECT because the following active contract "
+            "clause(s) were missing, unverified, or lacked evidence:\n"
+            + "\n".join(issue_lines)
+        )
+        original = verdict.feedback.strip()
+        feedback = f"{header}\n\nOriginal reviewer notes:\n{original}" if original else header
+        return False, failed_ids, feedback
+
     def _transition_task(self, task_id: str, status: TaskStatus, **fields: Any) -> Task:
         prev = self.store.get_task(task_id).status
         updated = self.store.update_status(task_id, status, **fields)
@@ -2250,6 +2318,7 @@ class OrchestratorRunner:
                     progress_text=progress_text,
                     task=task,
                     downstream_tasks=self._get_downstream_tasks(task.id),
+                    contracts=self.store.list_contracts(),
                     inbox_text=inbox_text,
                     gate_error_log=gate_error_log,
                     guard_error_text=guard_error_text,
@@ -2539,11 +2608,13 @@ class OrchestratorRunner:
             }
             overlaps_batch = not existing_batch_files.isdisjoint(set(last_guard_report.changed_files))
 
+            has_contract_clauses = bool(self._required_clause_ids_for_task(task))
             if (
                 task.complexity == TaskComplexity.EASY
                 and not last_guard_report.touched_yellow_zone
                 and not last_guard_report.has_soft_warnings
                 and not overlaps_batch
+                and not has_contract_clauses
                 and self.config.workflow.batch_review_size > 1
             ):
                 batch_raw_diff = self.git_ops.get_diff(task_base_sha)
@@ -2850,6 +2921,7 @@ class OrchestratorRunner:
             progress_text=self._read_progress_text(),
             task=task,
             downstream_tasks=self._get_downstream_tasks(task.id),
+            contracts=self.store.list_contracts(),
             filtered_diff=review_diff_input,
             diff_stat=diff_stat,
             last_report=last_report,
@@ -2884,14 +2956,14 @@ class OrchestratorRunner:
             if role == AgentRole.PRE_REVIEWER
             else EventType.REVIEW_COMPLETED
         )
-        self.event_bus.emit(
-            event_type,
-            task_id=task.id,
-            role=role,
-            provider=response.provider_name,
-            payload={"verdict": verdict.verdict.value},
-        )
         if response.exit_code != 0 or response.timed_out:
+            self.event_bus.emit(
+                event_type,
+                task_id=task.id,
+                role=role,
+                provider=response.provider_name,
+                payload={"verdict": verdict.verdict.value},
+            )
             raise _PausedByInfraError(
                 reason=(
                     f"{role.value} provider '{response.provider_name}' failed "
@@ -2901,7 +2973,31 @@ class OrchestratorRunner:
                 role=role,
                 provider=response.provider_name,
             )
-        return verdict.verdict == ReviewVerdictType.APPROVE, verdict.feedback
+
+        effective_verdict = verdict.verdict
+        effective_feedback = verdict.feedback
+        event_payload: dict[str, Any] = {"verdict": effective_verdict.value}
+
+        if effective_verdict == ReviewVerdictType.APPROVE:
+            ebr_ok, failed_clauses, ebr_feedback = self._check_evidence_bound_review(task, verdict)
+            if not ebr_ok:
+                effective_verdict = ReviewVerdictType.REJECT
+                effective_feedback = ebr_feedback
+                event_payload = {
+                    "verdict": effective_verdict.value,
+                    "raw_verdict": ReviewVerdictType.APPROVE.value,
+                    "reason": "evidence_bound_review_failed",
+                    "failed_clauses": failed_clauses,
+                }
+
+        self.event_bus.emit(
+            event_type,
+            task_id=task.id,
+            role=role,
+            provider=response.provider_name,
+            payload=event_payload,
+        )
+        return effective_verdict == ReviewVerdictType.APPROVE, effective_feedback
 
     # -------------------------------------------------------------------------
     # Batch Review (Easy Independent Tasks)

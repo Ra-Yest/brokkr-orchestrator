@@ -1,4 +1,4 @@
-"""CLI entry point for the AFK Orchestrator (`init`, `doctor`, `run`, `status`, `control`, `report`)."""
+"""CLI entry point for the AFK Orchestrator (`init`, `doctor`, `plan-check`, `run`, `status`, `control`, `report`)."""
 
 from __future__ import annotations
 
@@ -18,6 +18,7 @@ from orchestrator.events import EventBus
 from orchestrator.fs_utils import atomic_write_json, atomic_write_text
 from orchestrator.git_ops import GitOps
 from orchestrator.models import ControlAction, PipelineState, RunStatus, Task, TasksFile
+from orchestrator.plan_check import format_plan_check_table, run_plan_check
 from orchestrator.prompt_builder import DEFAULT_ROLE_PROMPT_FILES
 from orchestrator.providers.base import ProviderRegistry
 from orchestrator.proxy_monitor import build_proxy_monitor
@@ -782,6 +783,32 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     return 0 if all_ok else 1
 
 
+def cmd_plan_check(args: argparse.Namespace) -> int:
+    repo_root = Path(args.repo).resolve()
+    config_path = _default_config_path(repo_root, args.config)
+    config = load_pipeline_config(config_path)
+    report = run_plan_check(
+        repo_root,
+        config,
+        use_llm=bool(args.llm),
+    )
+    if args.as_json:
+        payload = {
+            "ok": not report.has_blockers,
+            "llm_used": report.llm_used,
+            "summary": {
+                "blockers": report.blocker_count,
+                "warnings": report.warning_count,
+                "info": report.info_count,
+            },
+            "findings": [f.model_dump(mode="json") for f in report.findings],
+        }
+        print(json.dumps(payload, indent=2, ensure_ascii=False))
+    else:
+        print(format_plan_check_table(report))
+    return 1 if report.has_blockers else 0
+
+
 def cmd_run(args: argparse.Namespace) -> int:
     repo_root = Path(args.repo).resolve()
     config_path = _default_config_path(repo_root, args.config)
@@ -940,6 +967,25 @@ def build_parser() -> argparse.ArgumentParser:
     p_doc.add_argument("--repo", default=".", help="Path to target git repository")
     p_doc.add_argument("--config", default=None, help="Path to pipeline.yaml")
     p_doc.set_defaults(func=cmd_doctor)
+
+    p_plan = sub.add_parser(
+        "plan-check",
+        help="Run pre-flight deterministic (and optional --llm) plan audit on tasks.json",
+    )
+    p_plan.add_argument("--repo", default=".", help="Path to target git repository")
+    p_plan.add_argument("--config", default=None, help="Path to pipeline.yaml")
+    p_plan.add_argument(
+        "--llm",
+        action="store_true",
+        help="Also invoke read-only planner LLM audit and merge findings",
+    )
+    p_plan.add_argument(
+        "--json",
+        dest="as_json",
+        action="store_true",
+        help="Output machine-readable JSON report",
+    )
+    p_plan.set_defaults(func=cmd_plan_check)
 
     p_run = sub.add_parser("run", help="Run the AFK pipeline orchestrator")
     p_run.add_argument("--repo", default=".", help="Path to target git repository")

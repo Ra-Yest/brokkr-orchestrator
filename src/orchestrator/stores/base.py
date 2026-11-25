@@ -5,7 +5,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from typing import Any, Literal
 
-from orchestrator.models import Task, TaskStatus
+from orchestrator.models import ContractSpec, Task, TaskStatus
 
 
 class BaseTaskStore(ABC):
@@ -57,3 +57,7 @@ class BaseTaskStore(ABC):
     @abstractmethod
     def depends_on_any(self, task_id: str, target_ids: set[str]) -> bool:
         """Return True if task_id directly or transitively depends on any ID in target_ids."""
+
+    def list_contracts(self) -> dict[str, ContractSpec]:
+        """Return typed contract definitions keyed by contract ID (empty by default)."""
+        return {}

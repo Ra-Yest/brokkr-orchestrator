@@ -238,6 +238,9 @@ diff_guard:
     "**/go.mod": ["**/go.sum"]
     "**/package.json": ["**/package-lock.json", "**/pnpm-lock.yaml", "**/yarn.lock"]
     "**/Cargo.toml": ["**/Cargo.lock"]
+  # Frozen shared contract fixtures (treated identically to zones.red_protected for all writing roles)
+  contracts_protected_paths:
+    - ".contracts/fixtures/**"
 
 placeholder_guard:
   enabled: true

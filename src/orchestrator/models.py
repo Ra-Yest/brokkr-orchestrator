@@ -6,7 +6,7 @@ from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 
 def utc_now_iso() -> str:
@@ -55,6 +55,68 @@ class TaskComplexity(StrEnum):
     HARD = "hard"
 
 
+class ContractKind(StrEnum):
+    ARTIFACT = "artifact"
+    ENTITY = "entity"
+    VALUE = "value"
+    WIRE = "wire"
+    FSM = "fsm"
+
+
+class ContractClause(BaseModel):
+    id: str = Field(min_length=1)
+    rule: str = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def _validate_non_blank(self) -> ContractClause:
+        if not self.id.strip():
+            raise ValueError("ContractClause 'id' must not be blank")
+        if not self.rule.strip():
+            raise ValueError("ContractClause 'rule' must not be blank")
+        return self
+
+
+class ContractSpec(BaseModel):
+    kind: ContractKind
+    surface: str = ""
+    description: str = ""
+    spec_source: str | None = None
+    fixtures: list[str] = Field(default_factory=list)
+    clauses: list[ContractClause] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def _validate_contract(self) -> ContractSpec:
+        seen_ids: set[str] = set()
+        for clause in self.clauses:
+            if clause.id in seen_ids:
+                raise ValueError(f"Duplicate clause id '{clause.id}' in contract")
+            seen_ids.add(clause.id)
+
+        if self.kind in (ContractKind.ENTITY, ContractKind.VALUE, ContractKind.WIRE):
+            if not self.clauses:
+                raise ValueError(
+                    f"Contract of kind '{self.kind.value}' requires non-empty 'clauses'"
+                )
+        elif self.kind == ContractKind.FSM:
+            if not self.spec_source or not self.spec_source.strip():
+                raise ValueError("Contract of kind 'fsm' requires non-empty 'spec_source'")
+            if self.spec_source.strip().lower().endswith(".md"):
+                raise ValueError(
+                    "Contract of kind 'fsm' requires a machine-readable 'spec_source' "
+                    "(cannot end with '.md')"
+                )
+        elif self.kind == ContractKind.ARTIFACT and not self.surface.strip():
+            raise ValueError("Contract of kind 'artifact' requires non-empty 'surface'")
+
+        return self
+
+
+class ContractCheckResult(BaseModel):
+    clause_id: str = Field(min_length=1)
+    status: Literal["VERIFIED", "VIOLATED", "UNTESTED"]
+    evidence: str = ""
+
+
 class TaskComment(BaseModel):
     timestamp: str = Field(default_factory=utc_now_iso)
     author: str
@@ -73,6 +135,8 @@ class Task(BaseModel):
     context_files: list[str] = Field(default_factory=list)
     verify_cmd: str | None = None
     acceptance_criteria: list[str] = Field(default_factory=list)
+    provides: list[str] = Field(default_factory=list)
+    consumes: list[str] = Field(default_factory=list)
     stage: str = "default"
     # Runtime tracking fields
     max_attempts: int | None = Field(default=None, ge=1)
@@ -96,6 +160,7 @@ class Task(BaseModel):
 
 class TasksFile(BaseModel):
     schema_version: int = 1
+    contracts: dict[str, ContractSpec] = Field(default_factory=dict)
     tasks: list[Task] = Field(default_factory=list)
 
 
@@ -124,6 +189,10 @@ class ParsedReviewVerdict(BaseModel):
     task_id: str
     verdict: ReviewVerdictType
     feedback: str = ""
+    contract_checks: list[ContractCheckResult] = Field(default_factory=list)
+
+
+ReviewOutput = ParsedReviewVerdict
 
 
 class SubtaskSpec(BaseModel):

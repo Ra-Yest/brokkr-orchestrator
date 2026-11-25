@@ -445,7 +445,7 @@ def evaluate_diff(
         if change.old_path:
             paths_to_check.append(_normalize_rel_path(change.old_path))
 
-        # 2a. Red protected paths (always forbidden for every role)
+        # 2a. Red protected paths and frozen contract fixtures (always forbidden for every writing role)
         if any(matches_any_glob(p, zones.red_protected) for p in paths_to_check):
             red_violations.append(
                 GuardViolation(
@@ -453,6 +453,23 @@ def evaluate_diff(
                     path=change.path,
                     line=None,
                     message=f"Attempted to modify protected Red Zone path ({change.status} {change.path})",
+                )
+            )
+            continue
+
+        if any(
+            matches_any_glob(p, config.diff_guard.contracts_protected_paths)
+            for p in paths_to_check
+        ):
+            red_violations.append(
+                GuardViolation(
+                    code="RED_ZONE_PROTECTED_FILE",
+                    path=change.path,
+                    line=None,
+                    message=(
+                        f"Attempted to modify protected contract fixture path "
+                        f"({change.status} {change.path})"
+                    ),
                 )
             )
             continue

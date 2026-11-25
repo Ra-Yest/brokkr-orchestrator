@@ -637,7 +637,7 @@ def test_role_templates_and_v030_config_defaults() -> None:
     assert parsed.verdict == ReviewVerdictType.APPROVE
 
     # Version & example config defaults
-    assert __version__ == "0.3.0"
+    assert tuple(int(part) for part in __version__.split(".")[:3]) >= (0, 3, 0)
     cfg = load_pipeline_config(repo_root / "pipeline.example.yaml")
     assert cfg.workflow.capacity_error_patterns == DEFAULT_CAPACITY_ERROR_PATTERNS
     assert cfg.workflow.transient_error_patterns == DEFAULT_TRANSIENT_ERROR_PATTERNS

@@ -49,3 +49,21 @@ BEGIN_SUBTASKS_JSON
 }
 END_SUBTASKS_JSON
 ```
+
+### Mode 2 — Pre-Flight Plan Audit (`orchestrator plan-check --llm`)
+
+When invoked in Plan Audit mode (prompt contains `## PLAN AUDIT INSTRUCTIONS`), remain strictly read-only and inspect active tasks, `allowed_paths`, `depends_on`, and `contracts` for semantic gaps, missing dependencies, weak acceptance criteria, or contract omissions. Output a strictly valid JSON array wrapped inside `BEGIN_PLAN_AUDIT_JSON` and `END_PLAN_AUDIT_JSON` (return `[]` if no issues are found):
+
+```text
+BEGIN_PLAN_AUDIT_JSON
+[
+  {
+    "severity": "BLOCKER",
+    "task_id": "T-002",
+    "code": "MISSING_CONTRACT_DEP",
+    "message": "Task T-002 depends on API payload defined in T-001 but omits C-API-V1 in consumes."
+  }
+]
+END_PLAN_AUDIT_JSON
+```
+*(Allowed `severity` values: `BLOCKER`, `WARNING`, `INFO`; `task_id` may be `null` for plan-wide findings.)*

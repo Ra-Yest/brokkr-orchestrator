@@ -479,6 +479,9 @@ class DiffGuardConfig(BaseModel):
     paired_paths: dict[str, list[str]] = Field(
         default_factory=lambda: {k: list(v) for k, v in DEFAULT_PAIRED_PATHS.items()}
     )
+    contracts_protected_paths: list[str] = Field(
+        default_factory=lambda: [".contracts/fixtures/**"]
+    )
 
 
 class PlaceholderGuardConfig(BaseModel):

@@ -281,10 +281,12 @@ def format_console_event(event: PipelineEvent) -> str | None:
         return f"[{ts}] yellow_zone_triggered {task_tag}files={joined}"
 
     if et == EventType.PRE_REVIEW_COMPLETED:
-        return f"[{ts}] pre_review_completed {task_tag}verdict={p.get('verdict')}"
+        reason = f" ({p.get('reason')})" if p.get("reason") else ""
+        return f"[{ts}] pre_review_completed {task_tag}verdict={p.get('verdict')}{reason}"
 
     if et == EventType.REVIEW_COMPLETED:
-        return f"[{ts}] review_completed {task_tag}verdict={p.get('verdict')}"
+        reason = f" ({p.get('reason')})" if p.get("reason") else ""
+        return f"[{ts}] review_completed {task_tag}verdict={p.get('verdict')}{reason}"
 
     if et == EventType.BATCH_REVIEW_STARTED:
         tids = p.get("task_ids")
