@@ -250,7 +250,10 @@ class CliAgentProvider(BaseAgentProvider):
                 file_output = output_file.read_text(encoding="utf-8", errors="replace")
 
         effective_raw = file_output if file_output.strip() else proc_res.stdout
-        combined_for_rl = f"{proc_res.stdout}\n{proc_res.stderr}"
+        if proc_res.exit_code != 0 or len(proc_res.stdout.strip()) <= 800:
+            combined_for_rl = f"{proc_res.stderr}\n{proc_res.stdout}"
+        else:
+            combined_for_rl = proc_res.stderr
         rate_limited, retry_after = self._detect_rate_limit(combined_for_rl)
         parsed_text = self._parse_output(effective_raw)
 

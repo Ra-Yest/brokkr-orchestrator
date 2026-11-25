@@ -15,7 +15,7 @@ from orchestrator.fs_utils import atomic_write_text
 from orchestrator.gates import GateRunner, trim_error_log
 from orchestrator.models import AgentRole
 from orchestrator.process_utils import run_noninteractive_process
-from orchestrator.providers.base import ProviderRequest
+from orchestrator.providers.base import ProviderRequest, ProviderResponse
 from orchestrator.providers.cli_provider import CliAgentProvider
 from tests.conftest import make_test_config
 
@@ -329,4 +329,64 @@ def test_subprocess_utf8_cyrillic_roundtrip_and_python_utf8_env(tmp_path: Path) 
     assert res.exit_code == 0
     assert res.timed_out is False
     assert f"ECHO: {cyrillic_prompt}" in res.stdout
+
+
+def test_cli_provider_rate_limit_detection_avoids_false_positives_on_long_success_stdout(
+    tmp_path: Path,
+) -> None:
+    helper = tmp_path / "rl_agent.py"
+    helper.write_text(
+        "import sys\n"
+        "mode = sys.argv[1]\n"
+        "if mode == 'long_ok':\n"
+        "    body = 'Implemented HTTP 429 handling and quota_exceeded retry logic. ' * 20\n"
+        "    assert len(body.strip()) > 800\n"
+        "    print(body)\n"
+        "    sys.exit(0)\n"
+        "elif mode == 'nonzero_stderr':\n"
+        "    sys.stderr.write('429 Too Many Requests\\n')\n"
+        "    sys.exit(1)\n"
+        "elif mode == 'zero_short_stdout':\n"
+        "    print('Error 429: Too Many Requests')\n"
+        "    sys.exit(0)\n",
+        encoding="utf-8",
+    )
+    attempt_dir = tmp_path / "attempt_1"
+    attempt_dir.mkdir()
+
+    def _invoke(mode: str) -> ProviderResponse:
+        provider = CliAgentProvider(
+            f"p_{mode}",
+            ProviderProfileConfig(
+                kind="cli",
+                command=[sys.executable, str(helper), mode],
+                prompt_mode="stdin",
+            ),
+        )
+        return provider.invoke(
+            ProviderRequest(
+                run_id="r1",
+                task_id="T1",
+                role=AgentRole.WORKER_EASY,
+                prompt="go",
+                workdir=tmp_path,
+                timeout_seconds=30,
+                attempt_dir=attempt_dir,
+            )
+        )
+
+    res_long_ok = _invoke("long_ok")
+    assert res_long_ok.exit_code == 0
+    assert res_long_ok.raw_stderr == ""
+    assert len(res_long_ok.raw_stdout.strip()) > 800
+    assert res_long_ok.rate_limited is False
+
+    res_nonzero = _invoke("nonzero_stderr")
+    assert res_nonzero.exit_code == 1
+    assert res_nonzero.rate_limited is True
+
+    res_short_zero = _invoke("zero_short_stdout")
+    assert res_short_zero.exit_code == 0
+    assert res_short_zero.rate_limited is True
+
 
