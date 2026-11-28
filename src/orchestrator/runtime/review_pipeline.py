@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
 
@@ -36,6 +37,15 @@ from orchestrator.runtime.escalation_manager import EscalationManager
 from orchestrator.runtime.lifecycle import RunnerLifecycleManager, TransitionTaskFn
 from orchestrator.runtime.provider_executor import ProviderExecutor
 from orchestrator.stores.base import BaseTaskStore
+
+
+@dataclass(frozen=True)
+class _CriticalSeamFinding:
+    consumer_id: str
+    seam_key: str
+    summary: str
+    report_path: Path
+    provider_name: str
 
 
 class ReviewPipeline:
@@ -803,9 +813,14 @@ class ReviewPipeline:
                 f"{failed_task.title}\nReason: {fail_reason[:300]}{blocked_line}",
             )
 
+        critical_seams: list[_CriticalSeamFinding] = []
         for approved_task in approved_tasks:
             refreshed = self.store.get_task(approved_task.id)
-            self._run_seam_audits_for_consumer(refreshed)
+            critical_seams.extend(
+                self._run_seam_audits_for_consumer(refreshed, pause_on_critical=False)
+            )
+        if critical_seams and self.config.workflow.seam_audit_pause_on_critical:
+            self._raise_critical_seam_pause(critical_seams)
 
     # -------------------------------------------------------------------------
     # Pairwise Seam Audit at Contract Closure Points (v0.3.2)
@@ -843,21 +858,54 @@ class ReviewPipeline:
                 contents[rel] = normalize_newlines(full.read_text(encoding="utf-8", errors="replace"))
         return contents
 
-    def _run_seam_audits_for_consumer(self, consumer: Task) -> None:
+    def _raise_critical_seam_pause(
+        self,
+        critical_seams: list[_CriticalSeamFinding],
+    ) -> None:
+        """Raise a pause error summarizing all critical seam audit findings."""
+        if len(critical_seams) == 1:
+            finding = critical_seams[0]
+            reason = (
+                f"Critical seam audit finding for {finding.seam_key}: "
+                f"{finding.summary} (report: {finding.report_path})"
+            )
+        else:
+            details = "; ".join(
+                f"{finding.seam_key}: {finding.summary} (report: {finding.report_path})"
+                for finding in critical_seams
+            )
+            reason = f"Critical seam audit findings ({len(critical_seams)}): {details}"
+
+        raise _PausedByInfraError(
+            reason=reason,
+            pause_reason="seam_audit_critical",
+            task_id=",".join(dict.fromkeys(f.consumer_id for f in critical_seams)),
+            role=AgentRole.SEAM_AUDITOR,
+            provider=",".join(dict.fromkeys(f.provider_name for f in critical_seams)),
+        )
+
+    def _run_seam_audits_for_consumer(
+        self,
+        consumer: Task,
+        *,
+        pause_on_critical: bool = True,
+    ) -> list[_CriticalSeamFinding]:
         """Run read-only pairwise seam audits when a committed consumer closes a contract."""
         if not self.config.workflow.seam_audit_enabled:
-            return
+            return []
         if not consumer.consumes:
-            return
+            return []
         contracts = self.store.list_contracts()
         if not contracts:
-            return
+            return []
 
         done_tasks = [
             t
             for t in self.store.list_tasks()
             if t.status == TaskStatus.DONE and t.resolution != "split"
         ]
+
+        critical_seams: list[_CriticalSeamFinding] = []
 
         for contract_id in consumer.consumes:
             spec = contracts.get(contract_id)
@@ -996,17 +1044,22 @@ class ReviewPipeline:
                     },
                 )
 
-                if (
-                    audit_output.verdict == "CRITICAL"
-                    and self.config.workflow.seam_audit_pause_on_critical
-                ):
-                    raise _PausedByInfraError(
-                        reason=(
-                            f"Critical seam audit finding for {seam_key}: "
-                            f"{audit_output.summary} (report: {report_path})"
-                        ),
-                        pause_reason="seam_audit_critical",
-                        task_id=consumer.id,
-                        role=AgentRole.SEAM_AUDITOR,
-                        provider=response.provider_name,
+                if audit_output.verdict == "CRITICAL":
+                    critical_seams.append(
+                        _CriticalSeamFinding(
+                            consumer_id=consumer.id,
+                            seam_key=seam_key,
+                            summary=audit_output.summary,
+                            report_path=report_path,
+                            provider_name=response.provider_name,
+                        )
                     )
+
+        if (
+            critical_seams
+            and pause_on_critical
+            and self.config.workflow.seam_audit_pause_on_critical
+        ):
+            self._raise_critical_seam_pause(critical_seams)
+
+        return critical_seams

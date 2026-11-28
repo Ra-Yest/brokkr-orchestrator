@@ -371,6 +371,324 @@ def test_seam_audit_critical_pauses_pipeline_and_skips_downstream_task_c(
     assert any(ev[0] == "pause" and "Seam Audit" in ev[1] for ev in notifier.events)
 
 
+def test_seam_audit_runs_all_contracts_before_pausing_on_critical(
+    temp_git_repo: Path,
+) -> None:
+    cfg = make_test_config(batch_review_size=1)
+    tasks_path = temp_git_repo / ".pipeline" / "tasks.json"
+    tf = TasksFile(
+        contracts={
+            **_c1_contract(),
+            "c2": ContractSpec(
+                kind=ContractKind.WIRE,
+                surface="src/features/alpha/mod.py:produce_two",
+                clauses=[ContractClause(id="INV-2", rule="Returns non-empty str")],
+            ),
+        },
+        tasks=[
+            Task(
+                id="A",
+                title="Producer task",
+                description="Produce c1 and c2",
+                complexity=TaskComplexity.MEDIUM,
+                allowed_paths=["src/features/alpha/**"],
+                provides=["c1", "c2"],
+            ),
+            Task(
+                id="B",
+                title="Consumer task",
+                description="Consume c1 and c2",
+                complexity=TaskComplexity.MEDIUM,
+                depends_on=["A"],
+                allowed_paths=["src/features/beta/**"],
+                consumes=["c1", "c2"],
+            ),
+            Task(
+                id="C",
+                title="Downstream task",
+                description="Must not run if any seam audit is CRITICAL",
+                complexity=TaskComplexity.MEDIUM,
+                depends_on=["B"],
+                allowed_paths=["src/features/gamma/**"],
+            ),
+        ],
+    )
+    atomic_write_json(tasks_path, tf.model_dump(mode="json"))
+
+    worker_task_ids: list[str | None] = []
+    audited_contracts: list[str] = []
+
+    def handler(req: ProviderRequest) -> ProviderResponse:
+        if req.role == AgentRole.WORKER_MEDIUM:
+            worker_task_ids.append(req.task_id)
+            if req.task_id == "A":
+                (req.workdir / "src" / "features" / "alpha" / "mod.py").write_text(
+                    "def produce() -> int:\n    return 1\n\ndef produce_two() -> str:\n    return 'ok'\n",
+                    encoding="utf-8",
+                )
+            elif req.task_id == "B":
+                (req.workdir / "src" / "features" / "beta" / "consumer.py").write_text(
+                    "def consume() -> str:\n    return 'wrong_type'\n",
+                    encoding="utf-8",
+                )
+            return ok_response("provider_main", "BEGIN_REPORT\nDone.\nEND_REPORT\nSTATUS: DONE\n")
+        if req.role in (AgentRole.PRE_REVIEWER, AgentRole.REVIEWER):
+            return ok_response(
+                "provider_reviewer_api",
+                (
+                    "BEGIN_FEEDBACK\nAll clauses verified.\nEND_FEEDBACK\n"
+                    "BEGIN_CONTRACT_CHECKS_JSON\n"
+                    '[{"clause_id": "INV-1", "status": "VERIFIED", "evidence": "src/features/alpha/mod.py:1"}, '
+                    '{"clause_id": "INV-2", "status": "VERIFIED", "evidence": "src/features/alpha/mod.py:4"}]\n'
+                    "END_CONTRACT_CHECKS_JSON\n"
+                    "VERDICT: APPROVE\n"
+                ),
+            )
+        if req.role == AgentRole.SEAM_AUDITOR:
+            if "**Contract ID:** `c1`" in req.prompt:
+                audited_contracts.append("c1")
+                return ok_response(
+                    "provider_reviewer_api",
+                    (
+                        "BEGIN_SEAM_AUDIT_JSON\n"
+                        '{"verdict": "CRITICAL", "summary": "Type mismatch on c1", "findings": ['
+                        '{"severity": "CRITICAL", "clause_id": "INV-1", "description": "Expected int, got str", '
+                        '"file_refs": ["src/features/beta/consumer.py:1"]}'
+                        "]}\n"
+                        "END_SEAM_AUDIT_JSON\n"
+                    ),
+                )
+            if "**Contract ID:** `c2`" in req.prompt:
+                audited_contracts.append("c2")
+                return ok_response(
+                    "provider_reviewer_api",
+                    (
+                        "BEGIN_SEAM_AUDIT_JSON\n"
+                        '{"verdict": "PASS", "summary": "Contract c2 aligned.", "findings": []}\n'
+                        "END_SEAM_AUDIT_JSON\n"
+                    ),
+                )
+            raise AssertionError(f"Unexpected seam audit prompt: {req.prompt[:200]}")
+        raise AssertionError(f"Unexpected role: {req.role}")
+
+    store = LocalJsonTaskStore(tasks_path)
+    registry, _ = make_mock_registry(cfg, handler)
+    runner = OrchestratorRunner(
+        repo_root=temp_git_repo,
+        config=cfg,
+        store=store,
+        registry=registry,
+        quiet=True,
+    )
+    status = runner.run()
+    assert status == RunStatus.PAUSED
+    assert audited_contracts == ["c1", "c2"]
+    assert "C" not in worker_task_ids
+    assert store.get_task("B").status == TaskStatus.DONE
+    assert store.get_task("C").status == TaskStatus.TODO
+
+    c1_report = temp_git_repo / ".pipeline" / "seam_audits" / "c1__A__B.json"
+    c2_report = temp_git_repo / ".pipeline" / "seam_audits" / "c2__A__B.json"
+    assert c1_report.is_file()
+    assert c2_report.is_file()
+    assert json.loads(c1_report.read_text(encoding="utf-8"))["verdict"] == "CRITICAL"
+    assert json.loads(c2_report.read_text(encoding="utf-8"))["verdict"] == "PASS"
+
+    state = PipelineState.model_validate(
+        json.loads((temp_git_repo / ".pipeline" / "state.json").read_text(encoding="utf-8"))
+    )
+    assert state.paused is True
+    assert state.pause_reason == "seam_audit_critical"
+    assert "c1:A:B" in state.audited_seams
+    assert "c2:A:B" in state.audited_seams
+
+    events = [
+        json.loads(line)
+        for line in (temp_git_repo / ".pipeline" / "events.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+        if line.strip()
+    ]
+    seam_events = [e for e in events if e["event_type"] == EventType.SEAM_AUDIT_COMPLETED.value]
+    assert len(seam_events) == 2
+    assert {e["payload"]["contract_id"]: e["payload"]["verdict"] for e in seam_events} == {
+        "c1": "CRITICAL",
+        "c2": "PASS",
+    }
+    pause_events = [e for e in events if e["event_type"] == EventType.PAUSE_ENTERED.value]
+    assert len(pause_events) == 1
+    assert "c1:A:B" in pause_events[0]["payload"]["details"]
+    assert "Type mismatch on c1" in pause_events[0]["payload"]["details"]
+
+
+def test_batch_review_runs_seam_audits_for_all_approved_consumers_before_pausing(
+    temp_git_repo: Path,
+) -> None:
+    cfg = make_test_config(batch_review_size=2)
+    tasks_path = temp_git_repo / ".pipeline" / "tasks.json"
+    tf = TasksFile(
+        contracts={
+            "c1": ContractSpec(
+                kind=ContractKind.ARTIFACT,
+                surface="src/features/alpha/mod.py:produce",
+                clauses=[],
+            ),
+            "c2": ContractSpec(
+                kind=ContractKind.ARTIFACT,
+                surface="src/features/alpha/mod.py:produce_two",
+                clauses=[],
+            ),
+        },
+        tasks=[
+            Task(
+                id="A",
+                title="Producer task",
+                description="Produce c1 and c2",
+                stage="stage_1",
+                complexity=TaskComplexity.MEDIUM,
+                allowed_paths=["src/features/alpha/**"],
+                provides=["c1", "c2"],
+            ),
+            Task(
+                id="B1",
+                title="Consumer one",
+                description="Consume c1",
+                stage="stage_2",
+                complexity=TaskComplexity.EASY,
+                depends_on=["A"],
+                allowed_paths=["src/features/beta/**"],
+                consumes=["c1"],
+            ),
+            Task(
+                id="B2",
+                title="Consumer two",
+                description="Consume c2",
+                stage="stage_2",
+                complexity=TaskComplexity.EASY,
+                depends_on=["A"],
+                allowed_paths=["src/features/gamma/**"],
+                consumes=["c2"],
+            ),
+            Task(
+                id="C",
+                title="Downstream task",
+                description="Must not run after batch critical seam audits",
+                stage="stage_3",
+                complexity=TaskComplexity.MEDIUM,
+                depends_on=["B1", "B2"],
+                allowed_paths=["src/features/delta/**"],
+            ),
+        ],
+    )
+    atomic_write_json(tasks_path, tf.model_dump(mode="json"))
+
+    worker_task_ids: list[str | None] = []
+    audited_contracts: list[str] = []
+
+    def handler(req: ProviderRequest) -> ProviderResponse:
+        if req.role in (AgentRole.WORKER_EASY, AgentRole.WORKER_MEDIUM):
+            worker_task_ids.append(req.task_id)
+            if req.task_id == "A":
+                (req.workdir / "src" / "features" / "alpha" / "mod.py").write_text(
+                    "def produce() -> int:\n    return 1\n\ndef produce_two() -> str:\n    return 'ok'\n",
+                    encoding="utf-8",
+                )
+            elif req.task_id == "B1":
+                (req.workdir / "src" / "features" / "beta" / "c1.py").write_text(
+                    "def consume_one() -> str:\n    return 'bad1'\n",
+                    encoding="utf-8",
+                )
+            elif req.task_id == "B2":
+                (req.workdir / "src" / "features" / "gamma" / "c2.py").write_text(
+                    "def consume_two() -> int:\n    return 0\n",
+                    encoding="utf-8",
+                )
+            return ok_response("provider_main", "BEGIN_REPORT\nDone.\nEND_REPORT\nSTATUS: DONE\n")
+        if req.role == AgentRole.PRE_REVIEWER:
+            return ok_response(
+                "provider_reviewer_api",
+                "BEGIN_FEEDBACK\nLGTM\nEND_FEEDBACK\nVERDICT: APPROVE\n",
+            )
+        if req.role == AgentRole.REVIEWER:
+            if req.task_id and "," in req.task_id:
+                return ok_response(
+                    "provider_reviewer_api",
+                    "BEGIN_BATCH_VERDICTS\n- #B1: APPROVE\n- #B2: APPROVE\nEND_BATCH_VERDICTS\n",
+                )
+            return ok_response(
+                "provider_reviewer_api",
+                "BEGIN_FEEDBACK\nLGTM\nEND_FEEDBACK\nVERDICT: APPROVE\n",
+            )
+        if req.role == AgentRole.SEAM_AUDITOR:
+            if "**Contract ID:** `c1`" in req.prompt:
+                audited_contracts.append("c1")
+                return ok_response(
+                    "provider_reviewer_api",
+                    (
+                        "BEGIN_SEAM_AUDIT_JSON\n"
+                        '{"verdict": "CRITICAL", "summary": "Mismatch on c1", "findings": []}\n'
+                        "END_SEAM_AUDIT_JSON\n"
+                    ),
+                )
+            if "**Contract ID:** `c2`" in req.prompt:
+                audited_contracts.append("c2")
+                return ok_response(
+                    "provider_reviewer_api",
+                    (
+                        "BEGIN_SEAM_AUDIT_JSON\n"
+                        '{"verdict": "CRITICAL", "summary": "Mismatch on c2", "findings": []}\n'
+                        "END_SEAM_AUDIT_JSON\n"
+                    ),
+                )
+            raise AssertionError(f"Unexpected seam audit prompt: {req.prompt[:200]}")
+        raise AssertionError(f"Unexpected role: {req.role}")
+
+    store = LocalJsonTaskStore(tasks_path)
+    registry, _ = make_mock_registry(cfg, handler)
+    runner = OrchestratorRunner(
+        repo_root=temp_git_repo,
+        config=cfg,
+        store=store,
+        registry=registry,
+        quiet=True,
+    )
+    status = runner.run()
+    assert status == RunStatus.PAUSED
+    assert audited_contracts == ["c1", "c2"]
+    assert "C" not in worker_task_ids
+    assert store.get_task("B1").status == TaskStatus.DONE
+    assert store.get_task("B2").status == TaskStatus.DONE
+    assert store.get_task("C").status == TaskStatus.TODO
+
+    assert (temp_git_repo / ".pipeline" / "seam_audits" / "c1__A__B1.json").is_file()
+    assert (temp_git_repo / ".pipeline" / "seam_audits" / "c2__A__B2.json").is_file()
+
+    state = PipelineState.model_validate(
+        json.loads((temp_git_repo / ".pipeline" / "state.json").read_text(encoding="utf-8"))
+    )
+    assert state.paused is True
+    assert state.pause_reason == "seam_audit_critical"
+    assert "c1:A:B1" in state.audited_seams
+    assert "c2:A:B2" in state.audited_seams
+
+    events = [
+        json.loads(line)
+        for line in (temp_git_repo / ".pipeline" / "events.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+        if line.strip()
+    ]
+    seam_events = [e for e in events if e["event_type"] == EventType.SEAM_AUDIT_COMPLETED.value]
+    assert len(seam_events) == 2
+    pause_events = [e for e in events if e["event_type"] == EventType.PAUSE_ENTERED.value]
+    assert len(pause_events) == 1
+    details = pause_events[0]["payload"]["details"]
+    assert "c1:A:B1" in details
+    assert "Mismatch on c1" in details
+    assert "c2:A:B2" in details
+    assert "Mismatch on c2" in details
+
+
 # ===========================================================================
 # 3. Seam Audit read-only protection
 # ===========================================================================
